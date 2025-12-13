@@ -544,3 +544,49 @@ class SupabaseClient:
                         for t in top_topics
                     ],
                 }
+
+    def delete_episode_topic(self, topic_id: int) -> bool:
+        """
+        Delete an episode topic by ID.
+
+        Args:
+            topic_id: Topic database ID
+
+        Returns:
+            True if deleted, False otherwise
+        """
+        query = "DELETE FROM episode_topics WHERE id = %s"
+
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (topic_id,))
+                deleted = cur.rowcount > 0
+                conn.commit()
+                return deleted
+
+    def update_episode_topic_key_points(
+        self,
+        topic_id: int,
+        key_points: List[str]
+    ) -> None:
+        """
+        Update key points for an episode topic.
+
+        Args:
+            topic_id: Topic database ID
+            key_points: New list of key points
+        """
+        from datetime import datetime, timezone
+
+        query = """
+            UPDATE episode_topics
+            SET key_points = %s, updated_at = %s
+            WHERE id = %s
+        """
+
+        now = datetime.now(timezone.utc)
+
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (key_points, now, topic_id))
+                conn.commit()
