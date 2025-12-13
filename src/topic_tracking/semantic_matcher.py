@@ -36,7 +36,7 @@ class SemanticTopicMatcher:
     2. Find duplicate topics for consolidation in dedupe process
     """
 
-    def __init__(self, similarity_threshold: float = 0.85):
+    def __init__(self, similarity_threshold: float = 0.80):
         """
         Initialize SemanticTopicMatcher.
 

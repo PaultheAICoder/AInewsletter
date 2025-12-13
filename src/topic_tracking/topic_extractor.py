@@ -36,7 +36,7 @@ class TopicExtractor:
         max_topics: int = 15,
         novelty_threshold: float = 0.30,
         enable_novelty_detection: bool = True,
-        semantic_similarity_threshold: float = 0.85
+        semantic_similarity_threshold: float = 0.80
     ):
         """
         Initialize TopicExtractor.

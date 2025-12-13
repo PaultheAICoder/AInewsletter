@@ -219,8 +219,8 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='Preview without making changes')
     parser.add_argument('--digest-topic', type=str, help='Process only specific digest topic')
     parser.add_argument('--days-back', type=int, default=30, help='Days of topics to consider (default: 30)')
-    parser.add_argument('--similarity-threshold', type=float, default=0.85,
-                        help='Similarity threshold for duplicates (default: 0.85)')
+    parser.add_argument('--similarity-threshold', type=float, default=0.80,
+                        help='Similarity threshold for duplicates (default: 0.80)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
 
     args = parser.parse_args()
