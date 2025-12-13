@@ -46,7 +46,8 @@ class ContentScorer:
         self,
         topics: List[Dict[str, Any]],
         score_threshold: float = None,
-        model: str = "gpt-4o-mini"
+        model: str = None,
+        db_client = None
     ):
         """
         Initialize content scorer.
@@ -54,7 +55,8 @@ class ContentScorer:
         Args:
             topics: List of topic dicts with 'name' and 'description'
             score_threshold: Minimum score for relevance (default: 0.65)
-            model: OpenAI model to use (default: gpt-4o-mini)
+            model: OpenAI model to use (default from web_settings: ai_content_scoring.model)
+            db_client: Database client for fetching settings
         """
         api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
@@ -63,12 +65,19 @@ class ContentScorer:
         self.client = OpenAI(api_key=api_key, timeout=60.0)
         self.topics = topics
         self.score_threshold = score_threshold or self.DEFAULT_THRESHOLD
-        self.model = model
         self.max_tokens = 1000
+
+        # Load model from web_settings if not provided
+        if model:
+            self.model = model
+        elif db_client:
+            self.model = db_client.get_setting('ai_content_scoring', 'model', 'gpt-4o-mini')
+        else:
+            self.model = 'gpt-4o-mini'
 
         logger.info(
             f"ContentScorer initialized with {len(topics)} topics, "
-            f"model={model}, threshold={self.score_threshold}"
+            f"model={self.model}, threshold={self.score_threshold}"
         )
 
     def _create_scoring_prompt(self, transcript: str) -> str:

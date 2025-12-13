@@ -21,21 +21,27 @@ class NoveltyDetector:
     Detects novelty in topics by comparing key points using embeddings.
     """
 
-    def __init__(self, novelty_threshold: float = 0.30):
+    def __init__(self, novelty_threshold: float = 0.30, db_client=None):
         """
         Initialize NoveltyDetector.
 
         Args:
             novelty_threshold: Minimum novelty score (0.0-1.0) required to consider content novel.
                              Default 0.30 means 30% novelty required.
+            db_client: Database client for fetching settings
         """
         api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable not set")
 
         self.client = OpenAI(api_key=api_key)
-        self.embedding_model = "text-embedding-3-small"  # Fast, cheap
         self.novelty_threshold = novelty_threshold
+
+        # Load embedding model from web_settings
+        if db_client:
+            self.embedding_model = db_client.get_setting('topic_evolution', 'embedding_model', 'text-embedding-3-small')
+        else:
+            self.embedding_model = "text-embedding-3-small"
 
     def calculate_novelty_score(
         self,
@@ -140,6 +146,6 @@ class NoveltyDetector:
         return float(dot_product / (norm1 * norm2))
 
 
-def get_novelty_detector(novelty_threshold: float = 0.30) -> NoveltyDetector:
+def get_novelty_detector(novelty_threshold: float = 0.30, db_client=None) -> NoveltyDetector:
     """Factory function to create NoveltyDetector instance"""
-    return NoveltyDetector(novelty_threshold=novelty_threshold)
+    return NoveltyDetector(novelty_threshold=novelty_threshold, db_client=db_client)

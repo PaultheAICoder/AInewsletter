@@ -327,7 +327,7 @@ def main():
         scorer = ContentScorer(
             topics=topics,
             score_threshold=score_threshold,
-            model="gpt-4o-mini"
+            db_client=db  # Load model from web_settings
         )
 
         # Initialize topic extractor (aligned with podscrape2 settings)

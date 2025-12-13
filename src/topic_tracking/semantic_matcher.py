@@ -36,22 +36,28 @@ class SemanticTopicMatcher:
     2. Find duplicate topics for consolidation in dedupe process
     """
 
-    def __init__(self, similarity_threshold: float = 0.80):
+    def __init__(self, similarity_threshold: float = 0.80, db_client=None):
         """
         Initialize SemanticTopicMatcher.
 
         Args:
             similarity_threshold: Minimum similarity (0.0-1.0) to consider topics as matching.
-                                 Default 0.85 means 85% similar = same topic.
+                                 Default 0.80 means 80% similar = same topic.
+            db_client: Database client for fetching settings
         """
         api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable not set")
 
         self.client = OpenAI(api_key=api_key)
-        self.embedding_model = "text-embedding-3-small"
         self.similarity_threshold = similarity_threshold
         self._embedding_cache: Dict[str, np.ndarray] = {}
+
+        # Load embedding model from web_settings
+        if db_client:
+            self.embedding_model = db_client.get_setting('topic_evolution', 'embedding_model', 'text-embedding-3-small')
+        else:
+            self.embedding_model = "text-embedding-3-small"
 
     def find_matching_topic(
         self,
