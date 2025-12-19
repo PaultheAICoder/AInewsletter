@@ -21,7 +21,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.youtube.transcript_fetcher import YouTubeTranscriptFetcher
+from src.youtube.ytdlp_fetcher import YtdlpTranscriptFetcher
 from src.youtube.feed_processor import YouTubeFeedProcessor
 from src.database.supabase_client import SupabaseClient
 from src.scoring.content_scorer import ContentScorer
@@ -30,9 +30,38 @@ from src.topic_tracking.topic_extractor import TopicExtractor
 # Minimum video duration in seconds (3 minutes)
 MIN_DURATION_SECONDS = 180
 
-# Delay range between feeds (seconds)
-MIN_DELAY = 5
-MAX_DELAY = 30
+# Delay between transcript fetches (seconds) - longer to avoid rate limiting
+TRANSCRIPT_FETCH_DELAY = 30
+
+# Default max transcripts per day (can be overridden in web_settings)
+DEFAULT_MAX_TRANSCRIPTS_PER_DAY = 5
+
+
+def get_transcripts_downloaded_today(db: SupabaseClient) -> int:
+    """
+    Count how many YouTube transcripts have been downloaded today.
+
+    Args:
+        db: Database client
+
+    Returns:
+        Number of transcripts downloaded today
+    """
+    query = """
+        SELECT COUNT(*) as count
+        FROM episodes e
+        JOIN feeds f ON e.feed_id = f.id
+        WHERE f.feed_url LIKE '%%youtube.com%%'
+          AND DATE(e.transcript_generated_at) = CURRENT_DATE
+          AND e.transcript_content IS NOT NULL
+          AND e.transcript_content != ''
+    """
+
+    with db._get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            result = cur.fetchone()
+            return result[0] if result else 0
 
 
 def setup_logging(verbose: bool = False):
@@ -70,14 +99,15 @@ def estimate_duration_from_transcript(word_count: int) -> int:
 def process_feed(
     feed: dict,
     db: SupabaseClient,
-    fetcher: YouTubeTranscriptFetcher,
+    fetcher: YtdlpTranscriptFetcher,
     feed_processor: YouTubeFeedProcessor,
     scorer: ContentScorer,
     score_threshold: float,
     topic_extractor: TopicExtractor = None,
     topics_with_tracking: list = None,
     dry_run: bool = False,
-    logger: logging.Logger = None
+    logger: logging.Logger = None,
+    max_transcripts_remaining: int = None
 ) -> dict:
     """
     Process a single YouTube feed.
@@ -126,8 +156,19 @@ def process_feed(
 
         logger.info(f"Found {len(new_videos)} new videos to process")
 
+        # Track transcripts fetched in this feed
+        transcripts_fetched_this_feed = 0
+
         # Process each new video
         for video in new_videos:
+            # Check if we've hit the daily transcript limit
+            if max_transcripts_remaining is not None:
+                remaining = max_transcripts_remaining - transcripts_fetched_this_feed
+                if remaining <= 0:
+                    logger.warning(
+                        f"Daily transcript limit reached. Skipping remaining {len(new_videos) - new_videos.index(video)} videos."
+                    )
+                    break
             video_id = video.video_id
 
             # Skip if already exists (double-check)
@@ -166,6 +207,12 @@ def process_feed(
                 continue
 
             results['transcripts_downloaded'] += 1
+            transcripts_fetched_this_feed += 1
+
+            # Add delay between transcript fetches to avoid rate limiting
+            if transcripts_fetched_this_feed > 0 and not dry_run:
+                logger.info(f"Waiting {TRANSCRIPT_FETCH_DELAY}s before next transcript fetch...")
+                time.sleep(TRANSCRIPT_FETCH_DELAY)
 
             # Estimate duration from word count
             estimated_duration = estimate_duration_from_transcript(transcript_result.word_count)
@@ -304,11 +351,26 @@ def main():
     try:
         # Initialize components
         db = SupabaseClient()
-        fetcher = YouTubeTranscriptFetcher()
+        fetcher = YtdlpTranscriptFetcher()
 
         # Get lookback days from settings
         lookback_days = db.get_setting('pipeline', 'discovery_lookback_days', 5)
         logger.info(f"Using lookback period: {lookback_days} days")
+
+        # Get max transcripts per day from settings
+        max_transcripts_per_day = db.get_setting('youtube', 'max_transcripts_per_day', DEFAULT_MAX_TRANSCRIPTS_PER_DAY)
+        logger.info(f"Max transcripts per day: {max_transcripts_per_day}")
+
+        # Count transcripts already fetched today
+        transcripts_today = get_transcripts_downloaded_today(db)
+        logger.info(f"Transcripts downloaded today so far: {transcripts_today}")
+
+        if transcripts_today >= max_transcripts_per_day:
+            logger.warning(f"Daily transcript limit ({max_transcripts_per_day}) already reached. Exiting.")
+            return 0
+
+        transcripts_remaining = max_transcripts_per_day - transcripts_today
+        logger.info(f"Transcripts remaining for today: {transcripts_remaining}")
 
         feed_processor = YouTubeFeedProcessor(lookback_days=lookback_days)
 
@@ -363,12 +425,13 @@ def main():
 
         # Process each feed
         all_results = []
+        total_transcripts_fetched = 0
+
         for i, feed in enumerate(feeds):
-            # Add random delay between feeds (except for first one)
-            if i > 0 and not args.no_delay:
-                delay = random.uniform(MIN_DELAY, MAX_DELAY)
-                logger.info(f"Waiting {delay:.1f}s before next feed...")
-                time.sleep(delay)
+            # Check if we've hit the daily limit across all feeds
+            if transcripts_remaining - total_transcripts_fetched <= 0:
+                logger.warning("Daily transcript limit reached. Stopping feed processing.")
+                break
 
             results = process_feed(
                 feed=feed,
@@ -380,9 +443,13 @@ def main():
                 topic_extractor=topic_extractor,
                 topics_with_tracking=topics_with_tracking,
                 dry_run=args.dry_run,
-                logger=logger
+                logger=logger,
+                max_transcripts_remaining=transcripts_remaining - total_transcripts_fetched
             )
             all_results.append(results)
+
+            # Track total transcripts fetched
+            total_transcripts_fetched += results['transcripts_downloaded']
 
         # Summary
         logger.info("=" * 60)

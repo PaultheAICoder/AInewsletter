@@ -12,7 +12,8 @@ Usage:
 import argparse
 import logging
 import sys
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -397,8 +398,24 @@ def main():
     if args.dry_run:
         logger.info("DRY RUN MODE - No changes will be made")
 
+    # Generate unique run ID and track start time
+    run_id = f"dedupe-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    started_at = datetime.now(timezone.utc)
+    db = None
+
     try:
         db = SupabaseClient()
+
+        # Log run start (only if not dry run)
+        if not args.dry_run:
+            db.log_pipeline_run(
+                run_id=run_id,
+                workflow_name='topic_deduplication',
+                status='running',
+                started_at=started_at,
+                trigger='manual' if args.digest_topic else 'cron'
+            )
+
         matcher = SemanticTopicMatcher(similarity_threshold=args.similarity_threshold, db_client=db)
 
         if args.digest_topic:
@@ -444,10 +461,50 @@ def main():
         logger.info(f"Key points consolidated: {total_points}")
         logger.info(f"Errors: {total_errors}")
 
+        # Log successful completion to database
+        if not args.dry_run:
+            finished_at = datetime.now(timezone.utc)
+            db.log_pipeline_run(
+                run_id=run_id,
+                workflow_name='topic_deduplication',
+                status='completed',
+                conclusion='success' if total_errors == 0 else 'failure',
+                started_at=started_at,
+                finished_at=finished_at,
+                phase={
+                    'digest_topics_processed': len(digest_topics),
+                    'topics_checked': total_checked,
+                    'story_arcs_found': total_arcs,
+                    'story_arc_topics_consolidated': total_arc_consolidated,
+                    'semantic_duplicate_groups': total_semantic_groups,
+                    'semantic_duplicates_merged': total_semantic_merged,
+                    'key_points_consolidated': total_points,
+                    'errors': total_errors,
+                    'duration_seconds': (finished_at - started_at).total_seconds()
+                },
+                notes=f"Processed {len(digest_topics)} digest topics, consolidated {total_arc_consolidated + total_semantic_merged} topics"
+            )
+
         return 0 if total_errors == 0 else 1
 
     except Exception as e:
         logger.error(f"Deduplication failed: {e}", exc_info=True)
+
+        # Log failure to database
+        if db and not args.dry_run:
+            try:
+                db.log_pipeline_run(
+                    run_id=run_id,
+                    workflow_name='topic_deduplication',
+                    status='completed',
+                    conclusion='failure',
+                    started_at=started_at,
+                    finished_at=datetime.now(timezone.utc),
+                    notes=f"Error: {str(e)}"
+                )
+            except Exception:
+                pass  # Don't fail on logging errors
+
         return 1
 
 

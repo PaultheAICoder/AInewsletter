@@ -590,3 +590,109 @@ class SupabaseClient:
             with conn.cursor() as cur:
                 cur.execute(query, (key_points, now, topic_id))
                 conn.commit()
+
+    # ==================== Pipeline Run Logging ====================
+
+    def log_pipeline_run(
+        self,
+        run_id: str,
+        workflow_name: str,
+        status: str,
+        conclusion: str = None,
+        started_at: datetime = None,
+        finished_at: datetime = None,
+        phase: Dict = None,
+        notes: str = None,
+        trigger: str = 'cron'
+    ) -> None:
+        """
+        Log a pipeline run to the database.
+
+        Args:
+            run_id: Unique identifier for the run
+            workflow_name: Name of the workflow (e.g., 'topic_deduplication')
+            status: Current status ('running', 'completed', 'failed')
+            conclusion: Final conclusion ('success', 'failure', 'cancelled')
+            started_at: When the run started
+            finished_at: When the run finished
+            phase: JSON data with phase-specific details
+            notes: Any additional notes or error messages
+            trigger: What triggered the run ('cron', 'manual', etc.)
+        """
+        import json
+
+        query = """
+            INSERT INTO pipeline_runs (
+                id, workflow_name, trigger, status, conclusion,
+                started_at, finished_at, phase, notes, created_at, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (id) DO UPDATE SET
+                status = EXCLUDED.status,
+                conclusion = EXCLUDED.conclusion,
+                finished_at = EXCLUDED.finished_at,
+                phase = EXCLUDED.phase,
+                notes = EXCLUDED.notes,
+                updated_at = EXCLUDED.updated_at
+        """
+
+        now = datetime.now(timezone.utc)
+
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (
+                    run_id,
+                    workflow_name,
+                    trigger,
+                    status,
+                    conclusion,
+                    started_at or now,
+                    finished_at,
+                    json.dumps(phase) if phase else None,
+                    notes,
+                    now,
+                    now
+                ))
+                conn.commit()
+
+    def get_recent_pipeline_runs(
+        self,
+        workflow_name: str = None,
+        limit: int = 20
+    ) -> List[Dict[str, Any]]:
+        """
+        Get recent pipeline runs.
+
+        Args:
+            workflow_name: Filter by workflow name (optional)
+            limit: Maximum number of runs to return
+
+        Returns:
+            List of pipeline run dictionaries
+        """
+        if workflow_name:
+            query = """
+                SELECT id, workflow_name, trigger, status, conclusion,
+                       started_at, finished_at, phase, notes
+                FROM pipeline_runs
+                WHERE workflow_name = %s
+                ORDER BY started_at DESC
+                LIMIT %s
+            """
+            params = (workflow_name, limit)
+        else:
+            query = """
+                SELECT id, workflow_name, trigger, status, conclusion,
+                       started_at, finished_at, phase, notes
+                FROM pipeline_runs
+                ORDER BY started_at DESC
+                LIMIT %s
+            """
+            params = (limit,)
+
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(query, params)
+                runs = cur.fetchall()
+                return [dict(r) for r in runs]
