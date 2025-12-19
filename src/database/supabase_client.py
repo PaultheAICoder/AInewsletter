@@ -696,3 +696,423 @@ class SupabaseClient:
                 cur.execute(query, params)
                 runs = cur.fetchall()
                 return [dict(r) for r in runs]
+
+    # ==================== Story Arc Methods ====================
+
+    def _normalize_arc_slug(self, arc_name: str) -> str:
+        """
+        Normalize story arc name to a slug for matching.
+
+        Args:
+            arc_name: The story arc name
+
+        Returns:
+            Normalized slug
+        """
+        import re
+        # Lowercase, replace spaces/special chars with hyphens, remove duplicates
+        slug = arc_name.lower().strip()
+        slug = re.sub(r'[^a-z0-9\s-]', '', slug)
+        slug = re.sub(r'[\s_]+', '-', slug)
+        slug = re.sub(r'-+', '-', slug)
+        slug = slug.strip('-')
+        return slug[:255]  # Limit length
+
+    def get_active_story_arcs(
+        self,
+        digest_topic: str,
+        days: int = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get active story arcs for a digest topic within retention window.
+
+        Args:
+            digest_topic: Parent topic name (e.g., "AI and Technology")
+            days: Override retention days (defaults to web_setting)
+
+        Returns:
+            List of story arc dictionaries with their events
+        """
+        if days is None:
+            days = self.get_setting('story_arcs', 'retention_days', 14)
+
+        query = """
+            SELECT sa.id, sa.arc_name, sa.arc_slug, sa.functional_category,
+                   sa.digest_topic, sa.summary, sa.started_at, sa.last_updated_at,
+                   sa.event_count, sa.source_count, sa.included_in_digest_id,
+                   sa.included_at, sa.created_at, sa.updated_at
+            FROM story_arcs sa
+            WHERE sa.digest_topic = %s
+              AND sa.last_updated_at >= NOW() - INTERVAL '%s days'
+            ORDER BY sa.last_updated_at DESC
+        """
+
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(query, (digest_topic, days))
+                arcs = [dict(a) for a in cur.fetchall()]
+
+                # Get events for each arc
+                for arc in arcs:
+                    events_query = """
+                        SELECT id, story_arc_id, event_date, event_summary,
+                               key_points, source_feed_id, source_episode_id,
+                               source_episode_guid, source_name, perspective,
+                               relevance_score, extracted_at
+                        FROM story_arc_events
+                        WHERE story_arc_id = %s
+                        ORDER BY event_date ASC
+                    """
+                    cur.execute(events_query, (arc['id'],))
+                    arc['events'] = [dict(e) for e in cur.fetchall()]
+
+                return arcs
+
+    def find_story_arc_by_slug(
+        self,
+        arc_slug: str,
+        digest_topic: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find a story arc by its slug and digest topic.
+
+        Args:
+            arc_slug: Normalized arc slug
+            digest_topic: Parent topic name
+
+        Returns:
+            Story arc dictionary or None
+        """
+        query = """
+            SELECT id, arc_name, arc_slug, functional_category,
+                   digest_topic, summary, started_at, last_updated_at,
+                   event_count, source_count
+            FROM story_arcs
+            WHERE arc_slug = %s AND digest_topic = %s
+        """
+
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(query, (arc_slug, digest_topic))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
+    def create_story_arc(
+        self,
+        arc_name: str,
+        digest_topic: str,
+        functional_category: str = 'other',
+        initial_event: Dict = None
+    ) -> Dict[str, Any]:
+        """
+        Create a new story arc, optionally with an initial event.
+
+        Args:
+            arc_name: Human-readable arc name
+            digest_topic: Parent topic (e.g., "AI and Technology")
+            functional_category: Classification (model_release, company_strategy, etc.)
+            initial_event: Optional dict with event_date, event_summary, key_points, etc.
+
+        Returns:
+            Created story arc dictionary
+        """
+        arc_slug = self._normalize_arc_slug(arc_name)
+        now = datetime.now(timezone.utc)
+
+        # Check if arc already exists
+        existing = self.find_story_arc_by_slug(arc_slug, digest_topic)
+        if existing:
+            logger.info(f"Story arc already exists: {arc_name} (id={existing['id']})")
+            return existing
+
+        insert_query = """
+            INSERT INTO story_arcs (
+                arc_name, arc_slug, functional_category, digest_topic,
+                started_at, last_updated_at, event_count, source_count,
+                created_at, updated_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, 0, 0, %s, %s
+            )
+            RETURNING id, arc_name, arc_slug, functional_category, digest_topic,
+                      summary, started_at, last_updated_at, event_count, source_count
+        """
+
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(insert_query, (
+                    arc_name, arc_slug, functional_category, digest_topic,
+                    now, now, now, now
+                ))
+                arc = dict(cur.fetchone())
+                conn.commit()
+
+                # Add initial event if provided
+                if initial_event:
+                    self.add_story_arc_event(
+                        story_arc_id=arc['id'],
+                        event_date=initial_event.get('event_date', now),
+                        event_summary=initial_event['event_summary'],
+                        key_points=initial_event.get('key_points', []),
+                        source_feed_id=initial_event.get('source_feed_id'),
+                        source_episode_id=initial_event.get('source_episode_id'),
+                        source_episode_guid=initial_event.get('source_episode_guid'),
+                        source_name=initial_event.get('source_name'),
+                        perspective=initial_event.get('perspective'),
+                        relevance_score=initial_event.get('relevance_score')
+                    )
+
+                logger.info(f"Created story arc: {arc_name} (id={arc['id']})")
+                return arc
+
+    def add_story_arc_event(
+        self,
+        story_arc_id: int,
+        event_date: datetime,
+        event_summary: str,
+        key_points: List[str] = None,
+        source_feed_id: int = None,
+        source_episode_id: int = None,
+        source_episode_guid: str = None,
+        source_name: str = None,
+        perspective: str = None,
+        relevance_score: float = None
+    ) -> Dict[str, Any]:
+        """
+        Add an event to a story arc timeline.
+
+        Args:
+            story_arc_id: Story arc database ID
+            event_date: When the event occurred
+            event_summary: 1-2 sentence description
+            key_points: Supporting details
+            source_feed_id: Source feed ID
+            source_episode_id: Source episode ID
+            source_episode_guid: Source episode GUID
+            source_name: Feed/episode title for display
+            perspective: positive, negative, neutral, analytical
+            relevance_score: Episode's relevance score
+
+        Returns:
+            Created event dictionary
+        """
+        now = datetime.now(timezone.utc)
+        max_events = self.get_setting('story_arcs', 'max_events_per_arc', 20)
+
+        insert_query = """
+            INSERT INTO story_arc_events (
+                story_arc_id, event_date, event_summary, key_points,
+                source_feed_id, source_episode_id, source_episode_guid,
+                source_name, perspective, relevance_score, extracted_at, created_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            RETURNING id, story_arc_id, event_date, event_summary, key_points,
+                      source_feed_id, source_episode_id, source_episode_guid,
+                      source_name, perspective, relevance_score, extracted_at
+        """
+
+        with self._get_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(insert_query, (
+                    story_arc_id, event_date, event_summary,
+                    key_points or [], source_feed_id, source_episode_id,
+                    source_episode_guid, source_name, perspective,
+                    relevance_score, now, now
+                ))
+                event = dict(cur.fetchone())
+
+                # Update story arc's last_updated_at, event_count, source_count
+                update_arc_query = """
+                    UPDATE story_arcs
+                    SET last_updated_at = %s,
+                        event_count = (
+                            SELECT COUNT(*) FROM story_arc_events
+                            WHERE story_arc_id = %s
+                        ),
+                        source_count = (
+                            SELECT COUNT(DISTINCT source_feed_id)
+                            FROM story_arc_events
+                            WHERE story_arc_id = %s AND source_feed_id IS NOT NULL
+                        ),
+                        updated_at = %s
+                    WHERE id = %s
+                """
+                cur.execute(update_arc_query, (
+                    event_date, story_arc_id, story_arc_id, now, story_arc_id
+                ))
+
+                # Prune old events if over limit
+                prune_query = """
+                    DELETE FROM story_arc_events
+                    WHERE id IN (
+                        SELECT id FROM story_arc_events
+                        WHERE story_arc_id = %s
+                        ORDER BY event_date ASC
+                        LIMIT GREATEST(0, (
+                            SELECT COUNT(*) FROM story_arc_events
+                            WHERE story_arc_id = %s
+                        ) - %s)
+                    )
+                """
+                cur.execute(prune_query, (story_arc_id, story_arc_id, max_events))
+
+                conn.commit()
+                return event
+
+    def get_or_create_story_arc(
+        self,
+        arc_name: str,
+        digest_topic: str,
+        functional_category: str = 'other',
+        initial_event: Dict = None
+    ) -> Dict[str, Any]:
+        """
+        Get existing story arc or create new one.
+
+        Args:
+            arc_name: Human-readable arc name
+            digest_topic: Parent topic
+            functional_category: Classification
+            initial_event: Event to add if creating new arc
+
+        Returns:
+            Story arc dictionary
+        """
+        arc_slug = self._normalize_arc_slug(arc_name)
+        existing = self.find_story_arc_by_slug(arc_slug, digest_topic)
+
+        if existing:
+            return existing
+
+        return self.create_story_arc(
+            arc_name=arc_name,
+            digest_topic=digest_topic,
+            functional_category=functional_category,
+            initial_event=initial_event
+        )
+
+    def get_story_arcs_for_prompt(
+        self,
+        digest_topic: str,
+        max_arcs: int = 15,
+        max_events_per_arc: int = 5
+    ) -> str:
+        """
+        Generate formatted story arcs for inclusion in extraction prompt.
+
+        Args:
+            digest_topic: Parent topic name
+            max_arcs: Maximum arcs to include
+            max_events_per_arc: Maximum events per arc to show
+
+        Returns:
+            Formatted string describing active story arcs
+        """
+        arcs = self.get_active_story_arcs(digest_topic)
+
+        if not arcs:
+            return ""
+
+        lines = []
+        for i, arc in enumerate(arcs[:max_arcs], 1):
+            lines.append(f"\n--- STORY ARC {i}: {arc['arc_name']} ---")
+            lines.append(f"Category: {arc['functional_category']}")
+            lines.append(f"Started: {arc['started_at'].strftime('%Y-%m-%d') if arc['started_at'] else 'Unknown'}")
+            lines.append(f"Last update: {arc['last_updated_at'].strftime('%Y-%m-%d') if arc['last_updated_at'] else 'Unknown'}")
+            lines.append(f"Sources: {arc['source_count']} feeds")
+            lines.append("Timeline:")
+
+            events = arc.get('events', [])
+            for event in events[-max_events_per_arc:]:  # Most recent events
+                event_date = event['event_date']
+                date_str = event_date.strftime('%b %d') if event_date else '???'
+                lines.append(f"  - [{date_str}] {event['event_summary']}")
+                if event.get('source_name'):
+                    lines.append(f"    (Source: {event['source_name']})")
+
+        return "\n".join(lines)
+
+    def get_story_arcs_for_digest(
+        self,
+        digest_topic: str,
+        min_events: int = 2,
+        exclude_included: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Get story arcs ready for digest/newsletter inclusion.
+
+        Args:
+            digest_topic: Parent topic name
+            min_events: Minimum events to be considered for digest
+            exclude_included: Exclude already-included arcs
+
+        Returns:
+            List of story arcs with events, sorted by relevance
+        """
+        arcs = self.get_active_story_arcs(digest_topic)
+
+        # Filter by minimum events
+        arcs = [a for a in arcs if a['event_count'] >= min_events]
+
+        # Exclude already included
+        if exclude_included:
+            arcs = [a for a in arcs if a['included_in_digest_id'] is None]
+
+        # Sort by event_count (more events = more significant story)
+        arcs.sort(key=lambda a: (a['event_count'], a['source_count']), reverse=True)
+
+        return arcs
+
+    def mark_story_arc_included(
+        self,
+        story_arc_id: int,
+        digest_id: int
+    ) -> None:
+        """
+        Mark a story arc as included in a digest.
+
+        Args:
+            story_arc_id: Story arc ID
+            digest_id: Digest ID
+        """
+        now = datetime.now(timezone.utc)
+
+        query = """
+            UPDATE story_arcs
+            SET included_in_digest_id = %s, included_at = %s, updated_at = %s
+            WHERE id = %s
+        """
+
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (digest_id, now, now, story_arc_id))
+                conn.commit()
+
+    def cleanup_old_story_arcs(self, days: int = None) -> int:
+        """
+        Delete story arcs older than retention period.
+
+        Args:
+            days: Override retention days
+
+        Returns:
+            Number of arcs deleted
+        """
+        if days is None:
+            days = self.get_setting('story_arcs', 'retention_days', 14)
+
+        # Note: story_arc_events are deleted via CASCADE
+        query = """
+            DELETE FROM story_arcs
+            WHERE last_updated_at < NOW() - INTERVAL '%s days'
+            RETURNING id
+        """
+
+        with self._get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, (days,))
+                deleted = cur.rowcount
+                conn.commit()
+                if deleted > 0:
+                    logger.info(f"Cleaned up {deleted} old story arcs")
+                return deleted

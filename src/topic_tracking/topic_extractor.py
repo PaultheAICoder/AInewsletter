@@ -1,10 +1,14 @@
 """
-TopicExtractor: Extracts high-level topics from episode transcripts using GPT.
-Used for topic tracking and story arc evolution in digest generation.
+TopicExtractor: Extracts story arcs from episode transcripts using GPT.
 
-Key feature: Story Arc Recognition - Topics are grouped into evolving stories
-rather than treated as isolated events. New information extends existing stories
-rather than creating duplicate topics.
+Story arcs are evolving narratives that track news stories over time.
+Each episode may introduce new story arcs or add events to existing ones.
+
+Key features:
+- LLM-driven story arc recognition (no hardcoded keywords)
+- Multiple perspectives from different feeds captured as events
+- Timeline tracking shows story evolution
+- Functional category classification for organization
 """
 
 import os
@@ -17,233 +21,118 @@ from typing import List, Dict, Optional, Tuple
 from openai import OpenAI
 from dotenv import load_dotenv
 
-from src.topic_tracking.novelty_detector import NoveltyDetector
-from src.topic_tracking.semantic_matcher import SemanticTopicMatcher
-
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Story arc patterns - keywords that indicate topics belong to the same story
-STORY_ARC_PATTERNS = {
-    "gemini-3": ["gemini 3", "gemini-3", "gemini3"],
-    "gpt-5-release": ["gpt-5", "gpt 5", "gpt5", "gpt-5.2", "gpt 5.2"],
-    "openai-strategy": ["openai code red", "openai's focus", "openai's shift", "openai financial"],
-    "ai-trust": ["ai trust", "trust in ai", "ai perception", "edelman", "ai sentiment"],
-    "google-glasses": ["google glass", "smart glasses", "project aura", "android xr"],
-    "cybersecurity-ciso": ["ciso", "cybersecurity", "zero trust", "cyber risk"],
-    "ai-benchmarks": ["benchmark", "gdpval", "ai grading", "model performance"],
-    "ai-education": ["ai education", "workforce development", "micro-credential", "educational"],
-    "social-media-regulation": ["tiktok", "social media ban", "first amendment", "fcc", "media regulation"],
-    "streaming-wars": ["netflix", "streaming", "warner bros", "disney acquisition"],
-    "square-block": ["square", "block inc"],
-}
+# Functional categories for story arc classification
+FUNCTIONAL_CATEGORIES = [
+    "model_release",      # New model announcements, updates, versions
+    "company_strategy",   # Business moves, pivots, leadership changes
+    "research",           # Papers, studies, breakthroughs
+    "regulation",         # Policy, legal, governance
+    "product_launch",     # New products, features, services
+    "partnership",        # Collaborations, acquisitions, investments
+    "controversy",        # Disputes, criticisms, debates
+    "industry_trend",     # Broader patterns, market shifts
+    "technique",          # New methods, approaches, architectures
+    "use_case",           # Applications, implementations
+    "other"               # Miscellaneous
+]
 
 
-class TopicExtractor:
+class StoryArcExtractor:
     """
-    Extracts high-level topics and key points from episode transcripts.
-    Groups topics into story arcs for tracking evolution over time.
+    Extracts and tracks story arcs from episode transcripts.
+
+    Story arcs are ongoing narratives (e.g., "OpenAI's GPT-5 Development")
+    that evolve over time with events from multiple sources.
     """
 
     def __init__(
         self,
         db_client,
-        max_topics: int = 15,
-        novelty_threshold: float = 0.30,
-        enable_novelty_detection: bool = True,
-        semantic_similarity_threshold: float = 0.80
+        max_arcs_per_episode: int = 10,
     ):
         """
-        Initialize TopicExtractor.
+        Initialize StoryArcExtractor.
 
         Args:
-            db_client: Database client with topic tracking methods
-            max_topics: Maximum topics to extract per episode
-            novelty_threshold: Minimum novelty score (0.0-1.0)
-            enable_novelty_detection: Whether to calculate novelty scores
-            semantic_similarity_threshold: Threshold for matching existing topics
+            db_client: Database client with story arc methods
+            max_arcs_per_episode: Maximum story arcs to extract per episode
         """
         api_key = os.getenv('OPENAI_API_KEY')
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable not set")
 
-        self.client = OpenAI(api_key=api_key, timeout=60.0)
+        self.client = OpenAI(api_key=api_key, timeout=120.0)
         self.db = db_client
-        self.max_topics = max_topics
+        self.max_arcs_per_episode = max_arcs_per_episode
 
         # Get model from web_settings, fallback to default
         try:
-            self.model = db_client.get_setting('topic_tracking', 'extraction_model', 'gpt-5.2-chat-latest')
-            logger.info(f"Using extraction model from web_settings: {self.model}")
-        except Exception as e:
-            self.model = "gpt-5.2-chat-latest"
-            logger.warning(f"Failed to get model from web_settings, using default: {self.model}")
-
-        # Initialize semantic matcher for existing topic detection
-        try:
-            self.semantic_matcher = SemanticTopicMatcher(
-                similarity_threshold=semantic_similarity_threshold,
-                db_client=db_client  # Load embedding model from web_settings
+            self.model = db_client.get_setting(
+                'topic_tracking', 'extraction_model', 'gpt-4o-mini'
             )
-            logger.info(f"Semantic matching enabled with threshold: {semantic_similarity_threshold}")
+            logger.info(f"Using extraction model: {self.model}")
         except Exception as e:
-            logger.warning(f"Failed to initialize semantic matcher: {e}")
-            self.semantic_matcher = None
+            self.model = "gpt-4o-mini"
+            logger.warning(f"Failed to get model from settings, using: {self.model}")
 
-        # Initialize novelty detector
-        self.novelty_detection_enabled = enable_novelty_detection
-        if enable_novelty_detection:
-            try:
-                self.novelty_detector = NoveltyDetector(
-                    novelty_threshold=novelty_threshold,
-                    db_client=db_client  # Load embedding model from web_settings
-                )
-                logger.info(f"Novelty detection enabled with threshold: {novelty_threshold}")
-            except Exception as e:
-                logger.warning(f"Failed to initialize novelty detector: {e}")
-                self.novelty_detector = None
-                self.novelty_detection_enabled = False
-        else:
-            self.novelty_detector = None
-
-    def _identify_story_arc(self, topic_name: str, key_points: List[str] = None) -> Optional[str]:
-        """
-        Identify which story arc a topic belongs to based on keywords.
-
-        Args:
-            topic_name: The topic name to check
-            key_points: Optional key points for additional context
-
-        Returns:
-            Story arc identifier or None if no match
-        """
-        text_to_check = topic_name.lower()
-        if key_points:
-            text_to_check += " " + " ".join(key_points).lower()
-
-        for arc_id, patterns in STORY_ARC_PATTERNS.items():
-            for pattern in patterns:
-                if pattern in text_to_check:
-                    return arc_id
-
-        return None
-
-    def _group_topics_by_story_arc(self, topics: List[Dict]) -> Dict[str, List[Dict]]:
-        """
-        Group existing topics by their story arc.
-
-        Args:
-            topics: List of topic dictionaries
-
-        Returns:
-            Dictionary mapping story arc IDs to lists of topics
-        """
-        arcs = {}
-        for topic in topics:
-            arc_id = self._identify_story_arc(
-                topic.get('topic_name', ''),
-                topic.get('key_points', [])
-            )
-            if arc_id:
-                if arc_id not in arcs:
-                    arcs[arc_id] = []
-                arcs[arc_id].append(topic)
-
-        return arcs
-
-    def _get_story_arcs_for_prompt(self, existing_topics: List[Dict]) -> str:
-        """
-        Generate story arc descriptions for the GPT prompt.
-
-        Args:
-            existing_topics: List of existing topics
-
-        Returns:
-            Formatted string describing active story arcs
-        """
-        arcs = self._group_topics_by_story_arc(existing_topics)
-
-        if not arcs:
-            return ""
-
-        lines = ["\n\nACTIVE STORY ARCS (extend these rather than creating new topics):"]
-
-        for arc_id, arc_topics in arcs.items():
-            # Get the canonical name (most common or first)
-            names = [t.get('topic_name') for t in arc_topics]
-            canonical_name = max(set(names), key=names.count) if names else arc_id
-
-            # Collect unique key points
-            all_points = []
-            for t in arc_topics:
-                all_points.extend(t.get('key_points', []))
-            unique_points = list(dict.fromkeys(all_points))[:4]
-
-            lines.append(f"\n📰 **{canonical_name}**")
-            lines.append(f"   Story ID: {arc_id}")
-            if unique_points:
-                lines.append(f"   Recent developments: {'; '.join(unique_points[:2])}")
-
-        lines.append("\nWhen content relates to an active story arc, use the story's canonical name and add NEW developments only.")
-
-        return "\n".join(lines)
-
-    def extract_and_store_topics(
+    def extract_and_store_story_arcs(
         self,
         episode_id: int,
         episode_guid: str,
+        feed_id: int,
         digest_topic: str,
         transcript: str,
-        relevance_score: float,
+        episode_title: str,
+        episode_published_date: datetime,
+        relevance_score: float = 0.0,
     ) -> List[Dict]:
         """
-        Extract high-level topics from transcript and store in database.
+        Extract story arcs from transcript and store in database.
 
-        Key behavior: Recognizes story arcs and extends existing stories rather
-        than creating duplicate topics. New information is added to evolving
-        narratives.
+        The LLM receives context about active story arcs and decides:
+        1. Which existing arcs this content continues
+        2. What new arcs this content introduces
 
         Args:
             episode_id: Episode database ID
-            episode_guid: Episode GUID (for logging)
+            episode_guid: Episode GUID
+            feed_id: Source feed ID
             digest_topic: Parent topic (e.g., "AI and Technology")
             transcript: Full episode transcript
-            relevance_score: Episode's score for digest_topic
+            episode_title: Episode title (for source attribution)
+            episode_published_date: When episode was published
+            relevance_score: Episode's relevance score
 
         Returns:
-            List of extracted topic dictionaries
+            List of story arc results (new arcs and events added)
         """
         logger.info(
-            f"Extracting topics from episode {episode_guid} for {digest_topic}"
+            f"Extracting story arcs from episode {episode_guid} for {digest_topic}"
         )
 
-        # Get existing topics for this digest_topic
-        existing_topics = []
-        story_arcs_prompt = ""
-        existing_topic_names = ""
-
+        # Get active story arcs for context
+        active_arcs_context = ""
         try:
-            existing_topics = self.db.get_recent_episode_topics(
+            active_arcs_context = self.db.get_story_arcs_for_prompt(
                 digest_topic=digest_topic,
-                days=30
+                max_arcs=20,
+                max_events_per_arc=4
             )
-            logger.info(f"Retrieved {len(existing_topics)} existing topics")
-
-            # Generate story arcs section for prompt
-            story_arcs_prompt = self._get_story_arcs_for_prompt(existing_topics)
-
-            # Also generate simple topic names list
-            if self.semantic_matcher and existing_topics:
-                existing_topic_names = self.semantic_matcher.get_topic_names_for_prompt(
-                    existing_topics, max_topics=50
-                )
+            arc_count = active_arcs_context.count("STORY ARC") if active_arcs_context else 0
+            logger.info(f"Retrieved {arc_count} active story arcs for context")
         except Exception as e:
-            logger.warning(f"Failed to retrieve existing topics: {e}")
+            logger.warning(f"Failed to retrieve active story arcs: {e}")
 
         # Create prompt for GPT
         prompt = self._create_extraction_prompt(
-            transcript, digest_topic, existing_topic_names, story_arcs_prompt
+            transcript=transcript,
+            digest_topic=digest_topic,
+            active_arcs_context=active_arcs_context,
+            episode_title=episode_title
         )
         schema = self._create_extraction_schema()
 
@@ -255,306 +144,350 @@ class TopicExtractor:
                 response_format={
                     "type": "json_schema",
                     "json_schema": {
-                        "name": "topic_extraction",
+                        "name": "story_arc_extraction",
                         "schema": schema,
                         "strict": True,
                     },
                 },
-                max_tokens=2000,
+                max_tokens=3000,
             )
 
             # Parse response
-            topics_data = json.loads(response.choices[0].message.content)
-            extracted_topics = topics_data.get("topics", [])
+            extraction_data = json.loads(response.choices[0].message.content)
+
+            # Process continuing arcs (updates to existing stories)
+            continuing_arcs = extraction_data.get("continuing_arcs", [])
+            new_arcs = extraction_data.get("new_arcs", [])
 
             logger.info(
-                f"Extracted {len(extracted_topics)} topics from episode {episode_guid}"
+                f"Extracted {len(continuing_arcs)} continuing arcs, "
+                f"{len(new_arcs)} new arcs from {episode_guid}"
             )
 
-            # Store each topic in database
-            stored_topics = []
-            topics_matched = 0
-            topics_new = 0
-            topics_arc_extended = 0
+            results = []
 
-            for topic_data in extracted_topics[: self.max_topics]:
+            # Handle continuing arcs (add events to existing stories)
+            for arc_data in continuing_arcs[:self.max_arcs_per_episode]:
                 try:
-                    topic_name = topic_data["name"]
-                    key_points = topic_data["key_points"]
+                    arc_name = arc_data["arc_name"]
+                    event_summary = arc_data["event_summary"]
+                    key_points = arc_data.get("key_points", [])
+                    perspective = arc_data.get("perspective")
 
-                    # Check if this belongs to a story arc
-                    story_arc = self._identify_story_arc(topic_name, key_points)
-
-                    # Try semantic matching against existing topics
-                    matched_topic = None
-                    if self.semantic_matcher and existing_topics:
-                        try:
-                            matched_topic = self.semantic_matcher.find_matching_topic(
-                                new_topic_name=topic_name,
-                                new_key_points=key_points,
-                                existing_topics=existing_topics,
-                                digest_topic=digest_topic
-                            )
-                        except Exception as e:
-                            logger.warning(f"Semantic matching failed for '{topic_name}': {e}")
-
-                    # If no semantic match but belongs to story arc, find arc's canonical topic
-                    if not matched_topic and story_arc:
-                        arc_topics = [
-                            t for t in existing_topics
-                            if self._identify_story_arc(t.get('topic_name', ''), t.get('key_points', [])) == story_arc
-                        ]
-                        if arc_topics:
-                            # Use the oldest topic as canonical
-                            arc_topics.sort(key=lambda t: t.get('first_mentioned_at') or t.get('created_at'))
-                            canonical = arc_topics[0]
-                            matched_topic = type('TopicMatch', (), {
-                                'topic_id': canonical.get('id'),
-                                'topic_slug': canonical.get('topic_slug'),
-                                'topic_name': canonical.get('topic_name'),
-                                'similarity_score': 0.0,  # Story arc match, not semantic
-                                'key_points': canonical.get('key_points', [])
-                            })()
-                            topics_arc_extended += 1
-                            logger.info(
-                                f"Topic '{topic_name}' matched to story arc '{story_arc}' "
-                                f"-> '{canonical.get('topic_name')}'"
-                            )
-
-                    if matched_topic:
-                        # Found existing topic - add new info to it
-                        topics_matched += 1
-                        topic_slug = matched_topic.topic_slug
-                        parent_topic_id = matched_topic.topic_id
-
-                        # Merge key points (new points only)
-                        existing_points_lower = {p.lower() for p in (matched_topic.key_points or [])}
-                        new_key_points = [
-                            kp for kp in key_points
-                            if kp.lower() not in existing_points_lower
-                        ]
-
-                        if not new_key_points:
-                            logger.info(
-                                f"Topic '{topic_name}' matched '{matched_topic.topic_name}' "
-                                f"but no new key points to add, skipping"
-                            )
-                            continue
-
-                        # Use matched topic name for consistency
-                        final_topic_name = matched_topic.topic_name
-                        # Combine existing and new key points (limit to 6 for story arcs)
-                        final_key_points = (list(matched_topic.key_points or []) + new_key_points)[:6]
-
-                        # Calculate novelty based on new key points
-                        novelty_score = len(new_key_points) / max(len(key_points), 1)
-
-                        logger.info(
-                            f"Matched '{topic_name}' to existing '{matched_topic.topic_name}', "
-                            f"adding {len(new_key_points)} new key points"
-                        )
-                    else:
-                        # New topic
-                        topics_new += 1
-                        topic_slug = self._normalize_topic_name(topic_name)
-                        final_topic_name = topic_name
-                        final_key_points = key_points
-                        novelty_score = 1.0
-                        parent_topic_id = None
-
-                        # Fall back to novelty detector for exact slug matches
-                        if self.novelty_detection_enabled and self.novelty_detector and existing_topics:
-                            try:
-                                novelty_score, parent_topic_id = self.novelty_detector.calculate_novelty_score(
-                                    current_topic={
-                                        'topic_slug': topic_slug,
-                                        'topic_name': topic_name,
-                                        'key_points': key_points
-                                    },
-                                    recent_topics=existing_topics
-                                )
-                            except Exception as e:
-                                logger.warning(f"Novelty detection failed for '{topic_name}': {e}")
-                                novelty_score = 1.0
-
-                    # Store topic with all fields
-                    stored_topic = self.db.store_episode_topic(
-                        episode_id=episode_id,
-                        topic_name=final_topic_name,
-                        topic_slug=topic_slug,
-                        key_points=final_key_points,
+                    # Find or get the existing arc
+                    arc = self.db.get_or_create_story_arc(
+                        arc_name=arc_name,
                         digest_topic=digest_topic,
-                        relevance_score=relevance_score,
-                        topic_type=topic_data.get("type", "other"),
-                        novelty_score=novelty_score,
-                        is_update=matched_topic is not None or topic_data.get("is_update", False),
-                        parent_topic_id=parent_topic_id,
-                        evolution_summary=topic_data.get("evolution_summary"),
+                        functional_category=arc_data.get("category", "other")
                     )
-                    stored_topics.append(
-                        {
-                            "name": final_topic_name,
-                            "type": topic_data.get("type", "other"),
-                            "key_points": final_key_points,
-                            "novelty_score": novelty_score,
-                            "matched_existing": matched_topic is not None,
-                            "story_arc": story_arc,
-                        }
+
+                    # Add the new event
+                    event = self.db.add_story_arc_event(
+                        story_arc_id=arc['id'],
+                        event_date=episode_published_date,
+                        event_summary=event_summary,
+                        key_points=key_points,
+                        source_feed_id=feed_id,
+                        source_episode_id=episode_id,
+                        source_episode_guid=episode_guid,
+                        source_name=episode_title,
+                        perspective=perspective,
+                        relevance_score=relevance_score
                     )
+
+                    results.append({
+                        "arc_name": arc_name,
+                        "arc_id": arc['id'],
+                        "is_new": False,
+                        "event_id": event['id'],
+                        "event_summary": event_summary
+                    })
+
+                    logger.info(
+                        f"Added event to story arc '{arc_name}' (id={arc['id']})"
+                    )
+
                 except Exception as e:
                     logger.warning(
-                        f"Failed to store topic '{topic_data['name']}': {e}"
+                        f"Failed to add event to arc '{arc_data.get('arc_name', 'unknown')}': {e}"
+                    )
+
+            # Handle new arcs (create new stories)
+            for arc_data in new_arcs[:self.max_arcs_per_episode - len(results)]:
+                try:
+                    arc_name = arc_data["arc_name"]
+                    event_summary = arc_data["event_summary"]
+                    key_points = arc_data.get("key_points", [])
+                    category = arc_data.get("category", "other")
+                    perspective = arc_data.get("perspective")
+
+                    # Create the arc with initial event
+                    arc = self.db.create_story_arc(
+                        arc_name=arc_name,
+                        digest_topic=digest_topic,
+                        functional_category=category,
+                        initial_event={
+                            "event_date": episode_published_date,
+                            "event_summary": event_summary,
+                            "key_points": key_points,
+                            "source_feed_id": feed_id,
+                            "source_episode_id": episode_id,
+                            "source_episode_guid": episode_guid,
+                            "source_name": episode_title,
+                            "perspective": perspective,
+                            "relevance_score": relevance_score
+                        }
+                    )
+
+                    results.append({
+                        "arc_name": arc_name,
+                        "arc_id": arc['id'],
+                        "is_new": True,
+                        "category": category,
+                        "event_summary": event_summary
+                    })
+
+                    logger.info(
+                        f"Created new story arc '{arc_name}' (id={arc['id']}, category={category})"
+                    )
+
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to create arc '{arc_data.get('arc_name', 'unknown')}': {e}"
                     )
 
             logger.info(
-                f"Episode {episode_guid}: {topics_new} new topics, "
-                f"{topics_matched} matched ({topics_arc_extended} via story arc)"
+                f"Episode {episode_guid}: {len([r for r in results if r['is_new']])} new arcs, "
+                f"{len([r for r in results if not r['is_new']])} arcs updated"
             )
 
-            return stored_topics
+            return results
 
         except Exception as e:
-            logger.error(f"Topic extraction failed for {episode_guid}: {e}")
+            logger.error(f"Story arc extraction failed for {episode_guid}: {e}")
             raise
 
     def _create_extraction_prompt(
         self,
         transcript: str,
         digest_topic: str,
-        existing_topic_names: str = "",
-        story_arcs_prompt: str = ""
+        active_arcs_context: str,
+        episode_title: str
     ) -> str:
         """
-        Create GPT prompt for topic extraction with story arc awareness.
+        Create GPT prompt for story arc extraction.
 
         Args:
-            transcript: Full episode transcript
+            transcript: Episode transcript
             digest_topic: Parent topic name
-            existing_topic_names: Formatted list of existing topic names
-            story_arcs_prompt: Story arcs section for the prompt
+            active_arcs_context: Formatted active story arcs
+            episode_title: Episode title for context
 
         Returns:
             Formatted prompt string
         """
-        truncated_transcript = transcript[:4000]
+        # Truncate transcript to reasonable length
+        truncated_transcript = transcript[:6000]
 
-        existing_topics_section = ""
-        if existing_topic_names:
-            existing_topics_section = f"""
+        active_arcs_section = ""
+        if active_arcs_context:
+            active_arcs_section = f"""
+## ACTIVE STORY ARCS
+The following stories are currently being tracked. If this episode discusses any of these stories,
+you should add a NEW EVENT to that story arc rather than creating a duplicate.
 
-EXISTING TOPICS (reuse these names when content matches):
-{existing_topic_names}
+{active_arcs_context}
+
+---
 """
 
-        return f"""Analyze this transcript and extract significant topics relevant to "{digest_topic}".
+        return f"""Analyze this podcast episode transcript and identify STORY ARCS related to "{digest_topic}".
 
-IMPORTANT: We track STORY ARCS - ongoing narratives that evolve over time. When you find content
-about an existing story, EXTEND that story rather than creating a new topic.
-{story_arcs_prompt}
-{existing_topics_section}
+A STORY ARC is an ongoing news narrative that evolves over time. Examples:
+- "OpenAI's GPT-5 Development" (tracks rumors → announcements → release → reactions)
+- "EU AI Act Implementation" (tracks drafts → votes → enforcement → industry response)
+- "Google Gemini Launch" (tracks leaks → announcement → reviews → updates)
 
-For each topic, provide:
-1. **Name**: Use existing topic name if this extends a story, otherwise create a clear, specific name
-2. **Type**: Classification (model_release, use_case, personality, research, company_news, regulation, technique, other)
-3. **Key Points**: 2-4 bullet points of NEW information only (what's new in this episode?)
-4. **Is Update**: true if this extends an existing story arc
-5. **Related To**: The story/topic this updates (if is_update=true)
-6. **Evolution Summary**: What's new/changed since the last update (if is_update=true)
+{active_arcs_section}
 
-Guidelines:
-- PRIORITIZE extending existing stories over creating new topics
-- Key points should capture NEW developments, not repeat known information
-- Focus on what CHANGED or what's NEW in this episode
-- Generic observations are not useful - be specific
-- If content relates to an active story arc, use that story's name
+## YOUR TASK
 
-Transcript (first 4000 chars):
+For this episode from "{episode_title}", identify:
+
+1. **CONTINUING ARCS**: Stories from the active list above that this episode discusses
+   - Add a NEW EVENT capturing what this episode says about the story
+   - Capture the episode's PERSPECTIVE (positive, negative, neutral, analytical)
+   - Include 2-3 specific key points from this episode
+
+2. **NEW ARCS**: New stories not in the active list
+   - Only create if this is a significant, newsworthy development
+   - Don't create arcs for general discussion topics (too broad)
+   - Each arc should be specific enough to track over time
+
+## CLASSIFICATION CATEGORIES
+Use one of these for each arc:
+- model_release: New model announcements, updates, versions
+- company_strategy: Business moves, pivots, leadership changes
+- research: Papers, studies, breakthroughs
+- regulation: Policy, legal, governance
+- product_launch: New products, features, services
+- partnership: Collaborations, acquisitions, investments
+- controversy: Disputes, criticisms, debates
+- industry_trend: Broader patterns, market shifts
+- technique: New methods, approaches, architectures
+- use_case: Applications, implementations
+- other: Miscellaneous
+
+## PERSPECTIVE VALUES
+- positive: Episode is enthusiastic/supportive about this development
+- negative: Episode is critical/concerned about this development
+- neutral: Episode presents factual coverage without strong stance
+- analytical: Episode provides in-depth analysis/comparison
+
+## TRANSCRIPT
 {truncated_transcript}
 
-Extract topics, prioritizing story arc continuity."""
+---
+Identify story arcs and events from this episode."""
 
     def _create_extraction_schema(self) -> dict:
         """
-        JSON schema for structured topic extraction.
+        JSON schema for structured story arc extraction.
 
         Returns:
             JSON schema dictionary
         """
+        arc_event_schema = {
+            "type": "object",
+            "properties": {
+                "arc_name": {
+                    "type": "string",
+                    "description": "Name of the story arc (use existing name if continuing)"
+                },
+                "event_summary": {
+                    "type": "string",
+                    "description": "1-2 sentence summary of what this episode says about the story"
+                },
+                "key_points": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "description": "Specific details from this episode"
+                },
+                "category": {
+                    "type": "string",
+                    "enum": FUNCTIONAL_CATEGORIES,
+                    "description": "Functional category of the story"
+                },
+                "perspective": {
+                    "type": "string",
+                    "enum": ["positive", "negative", "neutral", "analytical"],
+                    "description": "Episode's perspective on this story"
+                }
+            },
+            "required": ["arc_name", "event_summary", "key_points", "category", "perspective"],
+            "additionalProperties": False
+        }
+
         return {
             "type": "object",
             "properties": {
-                "topics": {
+                "continuing_arcs": {
                     "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "description": "Topic name (use existing name if extending a story)",
-                            },
-                            "type": {
-                                "type": "string",
-                                "description": "Topic classification",
-                                "enum": [
-                                    "model_release",
-                                    "use_case",
-                                    "personality",
-                                    "research",
-                                    "company_news",
-                                    "regulation",
-                                    "technique",
-                                    "other",
-                                ],
-                            },
-                            "key_points": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "minItems": 2,
-                                "maxItems": 4,
-                                "description": "NEW information from this episode",
-                            },
-                            "is_update": {
-                                "type": "boolean",
-                                "description": "True if this extends an existing story arc",
-                            },
-                            "related_to": {
-                                "anyOf": [
-                                    {"type": "string"},
-                                    {"type": "null"}
-                                ],
-                                "description": "Story/topic this updates (if is_update=true)",
-                            },
-                            "evolution_summary": {
-                                "anyOf": [
-                                    {"type": "string"},
-                                    {"type": "null"}
-                                ],
-                                "description": "What's new/changed (if is_update=true)",
-                            },
-                        },
-                        "required": ["name", "type", "key_points", "is_update", "related_to", "evolution_summary"],
-                        "additionalProperties": False,
-                    },
-                    "minItems": 1,
-                    "maxItems": 15,
+                    "items": arc_event_schema,
+                    "description": "Events for existing story arcs"
+                },
+                "new_arcs": {
+                    "type": "array",
+                    "items": arc_event_schema,
+                    "description": "New story arcs introduced by this episode"
                 }
             },
-            "required": ["topics"],
-            "additionalProperties": False,
+            "required": ["continuing_arcs", "new_arcs"],
+            "additionalProperties": False
         }
 
-    def _normalize_topic_name(self, topic_name: str) -> str:
-        """
-        Normalize topic name to slug for deduplication.
 
-        Args:
-            topic_name: Original topic name
+# Backwards compatibility alias
+class TopicExtractor(StoryArcExtractor):
+    """
+    Backwards-compatible alias for StoryArcExtractor.
 
-        Returns:
-            Normalized slug
+    The old TopicExtractor extracted topics; the new StoryArcExtractor
+    extracts story arcs. This alias allows existing code to work.
+    """
+
+    def __init__(
+        self,
+        db_client,
+        max_topics: int = 15,
+        novelty_threshold: float = 0.30,
+        enable_novelty_detection: bool = True,
+        semantic_similarity_threshold: float = 0.80
+    ):
+        # Ignore old parameters, use new defaults
+        super().__init__(
+            db_client=db_client,
+            max_arcs_per_episode=max_topics
+        )
+        logger.info(
+            "TopicExtractor is now StoryArcExtractor - "
+            "novelty_threshold and semantic_similarity_threshold are no longer used"
+        )
+
+    def extract_and_store_topics(
+        self,
+        episode_id: int,
+        episode_guid: str,
+        digest_topic: str,
+        transcript: str,
+        relevance_score: float,
+    ) -> List[Dict]:
         """
-        slug = topic_name.lower()
-        slug = re.sub(r"[^\w\s-]", "", slug)
-        slug = re.sub(r"[-\s]+", "-", slug)
-        slug = slug.strip("-")
-        return slug
+        Backwards-compatible wrapper for extract_and_store_story_arcs.
+
+        Note: This requires feed_id, episode_title, and episode_published_date
+        which the old API didn't have. We'll try to get them from the database.
+        """
+        # Try to get episode details from database
+        try:
+            episode = self.db.get_episode_by_guid(episode_guid)
+            if episode:
+                feed_id = episode.get('feed_id')
+                episode_title = episode.get('title', 'Unknown Episode')
+                episode_published_date = episode.get('published_date', datetime.now(timezone.utc))
+            else:
+                feed_id = None
+                episode_title = 'Unknown Episode'
+                episode_published_date = datetime.now(timezone.utc)
+        except Exception as e:
+            logger.warning(f"Failed to get episode details: {e}")
+            feed_id = None
+            episode_title = 'Unknown Episode'
+            episode_published_date = datetime.now(timezone.utc)
+
+        # Call the new method
+        results = self.extract_and_store_story_arcs(
+            episode_id=episode_id,
+            episode_guid=episode_guid,
+            feed_id=feed_id,
+            digest_topic=digest_topic,
+            transcript=transcript,
+            episode_title=episode_title,
+            episode_published_date=episode_published_date,
+            relevance_score=relevance_score
+        )
+
+        # Convert results to old format for compatibility
+        return [
+            {
+                "name": r.get("arc_name"),
+                "type": r.get("category", "other"),
+                "key_points": [],  # Events don't have key_points in the same way
+                "novelty_score": 1.0 if r.get("is_new") else 0.5,
+                "matched_existing": not r.get("is_new"),
+                "story_arc": r.get("arc_name")
+            }
+            for r in results
+        ]

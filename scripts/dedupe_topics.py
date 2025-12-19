@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Topic Deduplication and Story Arc Consolidation Script
+Story Arc Consolidation Script
 
-Consolidates topics that belong to the same story arc, merging their key points
-into a single evolving narrative. Also handles semantic duplicates.
+Consolidates story arcs that are semantically similar (the LLM might create
+"GPT-5.2 Release" and "GPT 5.2 Launch" as separate arcs when they should be one).
+
+Also cleans up old arcs beyond the retention window.
 
 Usage:
     python scripts/dedupe_topics.py [--dry-run] [--digest-topic NAME] [--verbose]
@@ -24,9 +26,6 @@ sys.path.insert(0, str(project_root))
 from src.database.supabase_client import SupabaseClient
 from src.topic_tracking.semantic_matcher import SemanticTopicMatcher
 
-# Import story arc patterns from topic extractor
-from src.topic_tracking.topic_extractor import STORY_ARC_PATTERNS
-
 
 def setup_logging(verbose: bool = False):
     """Configure logging."""
@@ -35,7 +34,7 @@ def setup_logging(verbose: bool = False):
     log_dir = project_root / 'logs'
     log_dir.mkdir(exist_ok=True)
 
-    log_file = log_dir / f"dedupe_topics_{datetime.now().strftime('%Y%m%d')}.log"
+    log_file = log_dir / f"story_arc_consolidation_{datetime.now().strftime('%Y%m%d')}.log"
 
     logging.basicConfig(
         level=level,
@@ -49,136 +48,82 @@ def setup_logging(verbose: bool = False):
     return logging.getLogger(__name__)
 
 
-def identify_story_arc(topic_name: str, key_points: List[str] = None) -> Optional[str]:
+def get_story_arcs_for_consolidation(
+    db: SupabaseClient,
+    digest_topic: str,
+    days: int = 14
+) -> List[Dict]:
     """
-    Identify which story arc a topic belongs to based on keywords.
+    Get story arcs for consolidation.
 
     Args:
-        topic_name: The topic name to check
-        key_points: Optional key points for additional context
+        db: Database client
+        digest_topic: Parent topic name
+        days: Days of history to consider
 
     Returns:
-        Story arc identifier or None if no match
+        List of story arc dictionaries
     """
-    text_to_check = topic_name.lower()
-    if key_points:
-        text_to_check += " " + " ".join(key_points).lower()
-
-    for arc_id, patterns in STORY_ARC_PATTERNS.items():
-        for pattern in patterns:
-            if pattern in text_to_check:
-                return arc_id
-
-    return None
-
-
-def group_topics_by_story_arc(topics: List[Dict]) -> Dict[str, List[Dict]]:
-    """
-    Group topics by their story arc.
-
-    Args:
-        topics: List of topic dictionaries
-
-    Returns:
-        Dictionary mapping story arc IDs to lists of topics
-    """
-    arcs = {}
-    for topic in topics:
-        arc_id = identify_story_arc(
-            topic.get('topic_name', ''),
-            topic.get('key_points', [])
-        )
-        if arc_id:
-            if arc_id not in arcs:
-                arcs[arc_id] = []
-            arcs[arc_id].append(topic)
-
+    arcs = db.get_active_story_arcs(digest_topic=digest_topic, days=days)
     return arcs
 
 
-def consolidate_story_arc(
-    arc_id: str,
-    topics: List[Dict],
-    db: SupabaseClient,
-    dry_run: bool = False,
+def find_similar_arc_groups(
+    arcs: List[Dict],
+    matcher: SemanticTopicMatcher,
+    similarity_threshold: float = 0.80,
     logger: logging.Logger = None
-) -> Dict:
+) -> List[List[Dict]]:
     """
-    Consolidate all topics in a story arc into one canonical topic.
+    Find groups of semantically similar story arcs.
 
     Args:
-        arc_id: Story arc identifier
-        topics: List of topics in this arc
-        db: Database client
-        dry_run: If True, don't make changes
+        arcs: List of story arc dictionaries
+        matcher: Semantic matcher instance
+        similarity_threshold: Minimum similarity to consider as same arc
         logger: Logger instance
 
     Returns:
-        Dict with consolidation statistics
+        List of groups, each group is a list of similar arcs
     """
-    stats = {
-        'arc_id': arc_id,
-        'topics_consolidated': 0,
-        'key_points_merged': 0,
-        'errors': []
-    }
+    if len(arcs) < 2:
+        return []
 
-    if len(topics) <= 1:
-        return stats
+    # Convert arcs to format expected by semantic matcher
+    # We use arc_name + first event summary for comparison
+    topics_for_matching = []
+    for arc in arcs:
+        events = arc.get('events', [])
+        first_event_summary = events[0]['event_summary'] if events else ""
 
-    # Sort by first_mentioned_at to find canonical (oldest)
-    topics.sort(key=lambda t: t.get('first_mentioned_at') or t.get('created_at') or datetime.min)
-    canonical = topics[0]
-    duplicates = topics[1:]
+        topics_for_matching.append({
+            'id': arc['id'],
+            'topic_name': arc['arc_name'],
+            'topic_slug': arc['arc_slug'],
+            'key_points': [first_event_summary] if first_event_summary else [],
+            'first_mentioned_at': arc['started_at'],
+            'created_at': arc['created_at']
+        })
 
-    if logger:
-        logger.info(f"Story Arc '{arc_id}': Consolidating {len(duplicates)} topics into '{canonical['topic_name']}'")
+    # Find duplicate groups
+    groups = matcher.find_duplicate_groups(
+        topics_for_matching,
+        similarity_threshold=similarity_threshold
+    )
 
-    # Collect all unique key points
-    all_key_points = list(canonical.get('key_points', []) or [])
-    seen_points_lower = {p.lower() for p in all_key_points}
+    # Convert back to arc format
+    arc_by_id = {arc['id']: arc for arc in arcs}
+    result = []
 
-    for dup in duplicates:
-        dup_points = dup.get('key_points', []) or []
-        for point in dup_points:
-            if point.lower() not in seen_points_lower:
-                all_key_points.append(point)
-                seen_points_lower.add(point.lower())
-                stats['key_points_merged'] += 1
+    for group in groups:
+        arc_group = [arc_by_id[t['id']] for t in group if t['id'] in arc_by_id]
+        if len(arc_group) > 1:
+            result.append(arc_group)
 
-        if logger:
-            logger.info(f"  - Merging '{dup['topic_name']}' (id={dup['id']})")
-
-    # Limit to 6 key points (story arcs can have more than regular topics)
-    final_key_points = all_key_points[:6]
-
-    if not dry_run:
-        try:
-            # Update canonical with merged key points
-            db.update_episode_topic_key_points(canonical['id'], final_key_points)
-
-            # Delete duplicates
-            for dup in duplicates:
-                db.delete_episode_topic(dup['id'])
-                stats['topics_consolidated'] += 1
-
-        except Exception as e:
-            error_msg = f"Failed to consolidate story arc {arc_id}: {e}"
-            if logger:
-                logger.error(error_msg)
-            stats['errors'].append(error_msg)
-    else:
-        stats['topics_consolidated'] = len(duplicates)
-
-    if logger:
-        logger.info(
-            f"  Result: '{canonical['topic_name']}' now has {len(final_key_points)} key points"
-        )
-
-    return stats
+    return result
 
 
-def merge_duplicate_topics(
+def merge_story_arcs(
     canonical: Dict,
     duplicates: List[Dict],
     db: SupabaseClient,
@@ -186,11 +131,11 @@ def merge_duplicate_topics(
     logger: logging.Logger = None
 ) -> Dict:
     """
-    Merge semantic duplicate topics into the canonical topic.
+    Merge duplicate story arcs into the canonical arc.
 
     Args:
-        canonical: The topic to keep (oldest/most mentioned)
-        duplicates: List of duplicate topics to merge
+        canonical: The arc to keep (oldest/most events)
+        duplicates: List of duplicate arcs to merge
         db: Database client
         dry_run: If True, don't make changes
         logger: Logger instance
@@ -200,223 +145,224 @@ def merge_duplicate_topics(
     """
     stats = {
         'canonical_id': canonical['id'],
-        'canonical_name': canonical['topic_name'],
-        'duplicates_merged': 0,
-        'key_points_added': 0,
+        'canonical_name': canonical['arc_name'],
+        'arcs_merged': 0,
+        'events_moved': 0,
         'errors': []
     }
 
-    canonical_points = set(canonical.get('key_points', []) or [])
-    new_key_points = []
-
     for dup in duplicates:
-        dup_points = dup.get('key_points', []) or []
-
-        canonical_points_lower = {p.lower() for p in canonical_points}
-        for point in dup_points:
-            if point.lower() not in canonical_points_lower:
-                new_key_points.append(point)
-                canonical_points_lower.add(point.lower())
-
         if logger:
             logger.info(
-                f"  Merging '{dup['topic_name']}' (id={dup['id']}) into "
-                f"'{canonical['topic_name']}' (id={canonical['id']})"
+                f"  Merging arc '{dup['arc_name']}' (id={dup['id']}, "
+                f"events={dup['event_count']}) into '{canonical['arc_name']}'"
             )
 
         if not dry_run:
             try:
-                db.delete_episode_topic(dup['id'])
-                stats['duplicates_merged'] += 1
+                # Move events from duplicate to canonical
+                # This is done via SQL since we don't have a direct method
+                with db._get_connection() as conn:
+                    with conn.cursor() as cur:
+                        # Update events to point to canonical arc
+                        cur.execute("""
+                            UPDATE story_arc_events
+                            SET story_arc_id = %s
+                            WHERE story_arc_id = %s
+                        """, (canonical['id'], dup['id']))
+                        events_moved = cur.rowcount
+                        stats['events_moved'] += events_moved
+
+                        # Delete the duplicate arc
+                        cur.execute("""
+                            DELETE FROM story_arcs WHERE id = %s
+                        """, (dup['id'],))
+
+                        # Update canonical arc's event_count and source_count
+                        cur.execute("""
+                            UPDATE story_arcs
+                            SET event_count = (
+                                SELECT COUNT(*) FROM story_arc_events
+                                WHERE story_arc_id = %s
+                            ),
+                            source_count = (
+                                SELECT COUNT(DISTINCT source_feed_id)
+                                FROM story_arc_events
+                                WHERE story_arc_id = %s AND source_feed_id IS NOT NULL
+                            ),
+                            updated_at = %s
+                            WHERE id = %s
+                        """, (canonical['id'], canonical['id'],
+                              datetime.now(timezone.utc), canonical['id']))
+
+                        conn.commit()
+
+                stats['arcs_merged'] += 1
+
             except Exception as e:
-                error_msg = f"Failed to delete duplicate topic {dup['id']}: {e}"
+                error_msg = f"Failed to merge arc {dup['id']}: {e}"
                 if logger:
                     logger.error(error_msg)
                 stats['errors'].append(error_msg)
-
-    if new_key_points:
-        combined_points = list(canonical.get('key_points', []) or []) + new_key_points
-        combined_points = combined_points[:6]
-
-        if logger:
-            logger.info(
-                f"  Adding {len(new_key_points)} new key points to canonical topic "
-                f"(total: {len(combined_points)})"
-            )
-
-        if not dry_run:
-            try:
-                db.update_episode_topic_key_points(canonical['id'], combined_points)
-                stats['key_points_added'] = len(new_key_points)
-            except Exception as e:
-                error_msg = f"Failed to update canonical topic {canonical['id']}: {e}"
-                if logger:
-                    logger.error(error_msg)
-                stats['errors'].append(error_msg)
+        else:
+            stats['arcs_merged'] += 1
+            stats['events_moved'] += dup['event_count']
 
     return stats
 
 
-def dedupe_digest_topic(
+def consolidate_story_arcs(
     digest_topic: str,
     db: SupabaseClient,
     matcher: SemanticTopicMatcher,
-    days_back: int = 30,
+    days_back: int = 14,
     similarity_threshold: float = 0.80,
     dry_run: bool = False,
     logger: logging.Logger = None
 ) -> Dict:
     """
-    Deduplicate and consolidate topics for a specific digest topic.
+    Consolidate story arcs for a digest topic.
 
     Args:
         digest_topic: The digest topic to process
         db: Database client
         matcher: Semantic matcher instance
-        days_back: How many days of topics to consider
-        similarity_threshold: Minimum similarity for semantic duplicates
+        days_back: Days of history to consider
+        similarity_threshold: Minimum similarity for merging
         dry_run: If True, don't make changes
         logger: Logger instance
 
     Returns:
-        Dict with deduplication statistics
+        Dict with consolidation statistics
     """
     stats = {
         'digest_topic': digest_topic,
-        'topics_checked': 0,
-        'story_arcs_found': 0,
-        'story_arc_topics_consolidated': 0,
-        'semantic_duplicate_groups': 0,
-        'semantic_duplicates_merged': 0,
-        'key_points_consolidated': 0,
+        'arcs_checked': 0,
+        'similar_groups_found': 0,
+        'arcs_merged': 0,
+        'events_moved': 0,
+        'arcs_cleaned_up': 0,
         'errors': []
     }
 
     if logger:
         logger.info(f"Processing digest topic: {digest_topic}")
 
-    # Get recent topics
-    topics = db.get_recent_episode_topics(digest_topic=digest_topic, days=days_back)
-    stats['topics_checked'] = len(topics)
+    # Get active story arcs
+    arcs = get_story_arcs_for_consolidation(db, digest_topic, days_back)
+    stats['arcs_checked'] = len(arcs)
 
     if logger:
-        logger.info(f"Found {len(topics)} topics in last {days_back} days")
+        logger.info(f"Found {len(arcs)} active story arcs")
 
-    if len(topics) < 2:
+    if len(arcs) < 2:
         if logger:
-            logger.info("Not enough topics to check for duplicates")
+            logger.info("Not enough arcs to check for duplicates")
         return stats
 
-    # PHASE 1: Consolidate story arcs
+    # Find similar arc groups
     if logger:
         logger.info("=" * 40)
-        logger.info("PHASE 1: Story Arc Consolidation")
+        logger.info("PHASE 1: Semantic Arc Consolidation")
         logger.info("=" * 40)
 
-    story_arcs = group_topics_by_story_arc(topics)
-    stats['story_arcs_found'] = len([a for a in story_arcs.values() if len(a) > 1])
+    similar_groups = find_similar_arc_groups(
+        arcs, matcher, similarity_threshold, logger
+    )
+    stats['similar_groups_found'] = len(similar_groups)
 
-    for arc_id, arc_topics in story_arcs.items():
-        if len(arc_topics) > 1:
-            arc_stats = consolidate_story_arc(
-                arc_id=arc_id,
-                topics=arc_topics,
-                db=db,
-                dry_run=dry_run,
-                logger=logger
-            )
-            stats['story_arc_topics_consolidated'] += arc_stats['topics_consolidated']
-            stats['key_points_consolidated'] += arc_stats['key_points_merged']
-            stats['errors'].extend(arc_stats['errors'])
-
-    # Refresh topics list after story arc consolidation
-    if not dry_run and stats['story_arc_topics_consolidated'] > 0:
-        topics = db.get_recent_episode_topics(digest_topic=digest_topic, days=days_back)
-
-    # PHASE 2: Semantic duplicate detection (for topics not in story arcs)
     if logger:
-        logger.info("=" * 40)
-        logger.info("PHASE 2: Semantic Duplicate Detection")
-        logger.info("=" * 40)
+        logger.info(f"Found {len(similar_groups)} groups of similar arcs")
 
-    # Filter out topics that are in story arcs (already handled)
-    non_arc_topics = [
-        t for t in topics
-        if identify_story_arc(t.get('topic_name', ''), t.get('key_points', [])) is None
-    ]
-
-    if len(non_arc_topics) >= 2:
-        duplicate_groups = matcher.find_duplicate_groups(
-            non_arc_topics, similarity_threshold=similarity_threshold
-        )
-        stats['semantic_duplicate_groups'] = len(duplicate_groups)
+    # Merge each group
+    for i, group in enumerate(similar_groups, 1):
+        # Sort by event_count descending, then by started_at ascending
+        group.sort(key=lambda a: (-a['event_count'], a['started_at'] or datetime.min))
+        canonical = group[0]
+        duplicates = group[1:]
 
         if logger:
-            logger.info(f"Found {len(duplicate_groups)} groups of semantic duplicates")
-
-        for i, group in enumerate(duplicate_groups, 1):
-            canonical = group[0]
-            duplicates = group[1:]
-
-            if logger:
-                logger.info(
-                    f"Group {i}: '{canonical['topic_name']}' has {len(duplicates)} duplicates"
-                )
-
-            merge_stats = merge_duplicate_topics(
-                canonical=canonical,
-                duplicates=duplicates,
-                db=db,
-                dry_run=dry_run,
-                logger=logger
+            logger.info(
+                f"Group {i}: '{canonical['arc_name']}' has {len(duplicates)} duplicates"
             )
 
-            stats['semantic_duplicates_merged'] += merge_stats['duplicates_merged']
-            stats['key_points_consolidated'] += merge_stats['key_points_added']
-            stats['errors'].extend(merge_stats['errors'])
+        merge_stats = merge_story_arcs(
+            canonical=canonical,
+            duplicates=duplicates,
+            db=db,
+            dry_run=dry_run,
+            logger=logger
+        )
+
+        stats['arcs_merged'] += merge_stats['arcs_merged']
+        stats['events_moved'] += merge_stats['events_moved']
+        stats['errors'].extend(merge_stats['errors'])
+
+    # PHASE 2: Cleanup old arcs
+    if logger:
+        logger.info("=" * 40)
+        logger.info("PHASE 2: Cleanup Old Arcs")
+        logger.info("=" * 40)
+
+    if not dry_run:
+        cleaned = db.cleanup_old_story_arcs(days=days_back)
+        stats['arcs_cleaned_up'] = cleaned
+        if logger:
+            logger.info(f"Cleaned up {cleaned} old story arcs")
+    else:
+        if logger:
+            logger.info("[DRY RUN] Would clean up old story arcs")
 
     return stats
 
 
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description='Topic Deduplication and Story Arc Consolidation')
+    parser = argparse.ArgumentParser(description='Story Arc Consolidation')
     parser.add_argument('--dry-run', action='store_true', help='Preview without making changes')
     parser.add_argument('--digest-topic', type=str, help='Process only specific digest topic')
-    parser.add_argument('--days-back', type=int, default=30, help='Days of topics to consider (default: 30)')
+    parser.add_argument('--days-back', type=int, default=14, help='Days of history to consider (default: 14)')
     parser.add_argument('--similarity-threshold', type=float, default=0.80,
-                        help='Similarity threshold for semantic duplicates (default: 0.80)')
+                        help='Similarity threshold for merging (default: 0.80)')
     parser.add_argument('--verbose', '-v', action='store_true', help='Enable verbose logging')
 
     args = parser.parse_args()
 
     logger = setup_logging(args.verbose)
     logger.info("=" * 60)
-    logger.info("Topic Deduplication & Story Arc Consolidation")
+    logger.info("Story Arc Consolidation")
     logger.info("=" * 60)
 
     if args.dry_run:
         logger.info("DRY RUN MODE - No changes will be made")
 
     # Generate unique run ID and track start time
-    run_id = f"dedupe-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    run_id = f"arc-consolidate-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     started_at = datetime.now(timezone.utc)
     db = None
 
     try:
         db = SupabaseClient()
 
+        # Get retention days from settings
+        retention_days = db.get_setting('story_arcs', 'retention_days', 14)
+        days_back = args.days_back if args.days_back else retention_days
+        logger.info(f"Using retention window: {days_back} days")
+
         # Log run start (only if not dry run)
         if not args.dry_run:
             db.log_pipeline_run(
                 run_id=run_id,
-                workflow_name='topic_deduplication',
+                workflow_name='story_arc_consolidation',
                 status='running',
                 started_at=started_at,
                 trigger='manual' if args.digest_topic else 'cron'
             )
 
-        matcher = SemanticTopicMatcher(similarity_threshold=args.similarity_threshold, db_client=db)
+        matcher = SemanticTopicMatcher(
+            similarity_threshold=args.similarity_threshold,
+            db_client=db
+        )
 
         if args.digest_topic:
             digest_topics = [args.digest_topic]
@@ -428,11 +374,11 @@ def main():
 
         all_stats = []
         for digest_topic in digest_topics:
-            stats = dedupe_digest_topic(
+            stats = consolidate_story_arcs(
                 digest_topic=digest_topic,
                 db=db,
                 matcher=matcher,
-                days_back=args.days_back,
+                days_back=days_back,
                 similarity_threshold=args.similarity_threshold,
                 dry_run=args.dry_run,
                 logger=logger
@@ -444,21 +390,19 @@ def main():
         logger.info("CONSOLIDATION COMPLETE - SUMMARY")
         logger.info("=" * 60)
 
-        total_checked = sum(s['topics_checked'] for s in all_stats)
-        total_arcs = sum(s['story_arcs_found'] for s in all_stats)
-        total_arc_consolidated = sum(s['story_arc_topics_consolidated'] for s in all_stats)
-        total_semantic_groups = sum(s['semantic_duplicate_groups'] for s in all_stats)
-        total_semantic_merged = sum(s['semantic_duplicates_merged'] for s in all_stats)
-        total_points = sum(s['key_points_consolidated'] for s in all_stats)
+        total_checked = sum(s['arcs_checked'] for s in all_stats)
+        total_groups = sum(s['similar_groups_found'] for s in all_stats)
+        total_merged = sum(s['arcs_merged'] for s in all_stats)
+        total_events_moved = sum(s['events_moved'] for s in all_stats)
+        total_cleaned = sum(s['arcs_cleaned_up'] for s in all_stats)
         total_errors = sum(len(s['errors']) for s in all_stats)
 
         logger.info(f"Digest topics processed: {len(digest_topics)}")
-        logger.info(f"Topics checked: {total_checked}")
-        logger.info(f"Story arcs found: {total_arcs}")
-        logger.info(f"Story arc topics consolidated: {total_arc_consolidated}")
-        logger.info(f"Semantic duplicate groups: {total_semantic_groups}")
-        logger.info(f"Semantic duplicates merged: {total_semantic_merged}")
-        logger.info(f"Key points consolidated: {total_points}")
+        logger.info(f"Story arcs checked: {total_checked}")
+        logger.info(f"Similar groups found: {total_groups}")
+        logger.info(f"Arcs merged: {total_merged}")
+        logger.info(f"Events moved: {total_events_moved}")
+        logger.info(f"Arcs cleaned up: {total_cleaned}")
         logger.info(f"Errors: {total_errors}")
 
         # Log successful completion to database
@@ -466,36 +410,35 @@ def main():
             finished_at = datetime.now(timezone.utc)
             db.log_pipeline_run(
                 run_id=run_id,
-                workflow_name='topic_deduplication',
+                workflow_name='story_arc_consolidation',
                 status='completed',
                 conclusion='success' if total_errors == 0 else 'failure',
                 started_at=started_at,
                 finished_at=finished_at,
                 phase={
                     'digest_topics_processed': len(digest_topics),
-                    'topics_checked': total_checked,
-                    'story_arcs_found': total_arcs,
-                    'story_arc_topics_consolidated': total_arc_consolidated,
-                    'semantic_duplicate_groups': total_semantic_groups,
-                    'semantic_duplicates_merged': total_semantic_merged,
-                    'key_points_consolidated': total_points,
+                    'arcs_checked': total_checked,
+                    'similar_groups_found': total_groups,
+                    'arcs_merged': total_merged,
+                    'events_moved': total_events_moved,
+                    'arcs_cleaned_up': total_cleaned,
                     'errors': total_errors,
                     'duration_seconds': (finished_at - started_at).total_seconds()
                 },
-                notes=f"Processed {len(digest_topics)} digest topics, consolidated {total_arc_consolidated + total_semantic_merged} topics"
+                notes=f"Processed {len(digest_topics)} digest topics, merged {total_merged} arcs"
             )
 
         return 0 if total_errors == 0 else 1
 
     except Exception as e:
-        logger.error(f"Deduplication failed: {e}", exc_info=True)
+        logger.error(f"Consolidation failed: {e}", exc_info=True)
 
         # Log failure to database
         if db and not args.dry_run:
             try:
                 db.log_pipeline_run(
                     run_id=run_id,
-                    workflow_name='topic_deduplication',
+                    workflow_name='story_arc_consolidation',
                     status='completed',
                     conclusion='failure',
                     started_at=started_at,
