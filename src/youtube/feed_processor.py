@@ -6,12 +6,19 @@ Parses YouTube RSS feeds to detect new videos and filter by duration.
 
 import logging
 import re
+import time
+import requests
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
 import feedparser
 
 logger = logging.getLogger(__name__)
+
+# Retry configuration for feed fetching
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 5
+REQUEST_TIMEOUT = 30
 
 
 @dataclass
@@ -58,6 +65,7 @@ class YouTubeFeedProcessor:
     def parse_feed(self, feed_url: str) -> List[YouTubeVideo]:
         """
         Parse a YouTube RSS feed and return video entries.
+        Includes retry logic for transient failures.
 
         Args:
             feed_url: YouTube RSS feed URL
@@ -74,27 +82,86 @@ class YouTubeFeedProcessor:
             logger.error(f"Could not extract channel ID from: {feed_url}")
             return []
 
-        try:
-            feed = feedparser.parse(feed_url)
+        last_error = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                # Use requests to fetch with proper headers and timeout
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (compatible; PodcastDigest/1.0)',
+                    'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+                }
+                response = requests.get(feed_url, headers=headers, timeout=REQUEST_TIMEOUT)
 
-            if feed.bozo and feed.bozo_exception:
-                logger.error(f"Feed parse error for {feed_url}: {feed.bozo_exception}")
-                return []
+                # Check for non-200 responses
+                if response.status_code != 200:
+                    last_error = f"HTTP {response.status_code}: {response.reason}"
+                    logger.warning(f"Feed fetch attempt {attempt}/{MAX_RETRIES} failed for {feed_url}: {last_error}")
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_DELAY_SECONDS * attempt)  # Exponential backoff
+                        continue
+                    else:
+                        logger.error(f"Feed fetch failed after {MAX_RETRIES} attempts for {feed_url}: {last_error}")
+                        return []
 
-            videos = []
-            channel_name = feed.feed.get('title', 'Unknown Channel')
+                # Check if response looks like XML (not HTML error page)
+                content_type = response.headers.get('content-type', '')
+                content_start = response.text[:500].strip().lower()
 
-            for entry in feed.entries:
-                video = self._parse_entry(entry, channel_id, channel_name)
-                if video:
-                    videos.append(video)
+                if 'html' in content_type or content_start.startswith('<!doctype html') or '<html' in content_start:
+                    last_error = "YouTube returned HTML instead of XML (possible rate limiting/captcha)"
+                    logger.warning(f"Feed fetch attempt {attempt}/{MAX_RETRIES} failed for {feed_url}: {last_error}")
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_DELAY_SECONDS * attempt)
+                        continue
+                    else:
+                        logger.error(f"Feed fetch failed after {MAX_RETRIES} attempts for {feed_url}: {last_error}")
+                        return []
 
-            logger.info(f"Parsed {len(videos)} videos from {channel_name}")
-            return videos
+                # Parse the XML content
+                feed = feedparser.parse(response.content)
 
-        except Exception as e:
-            logger.error(f"Failed to parse feed {feed_url}: {e}")
-            return []
+                if feed.bozo and feed.bozo_exception:
+                    last_error = f"XML parse error: {feed.bozo_exception}"
+                    logger.warning(f"Feed parse attempt {attempt}/{MAX_RETRIES} failed for {feed_url}: {last_error}")
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_DELAY_SECONDS * attempt)
+                        continue
+                    else:
+                        logger.error(f"Feed parse failed after {MAX_RETRIES} attempts for {feed_url}: {last_error}")
+                        return []
+
+                videos = []
+                channel_name = feed.feed.get('title', 'Unknown Channel')
+
+                for entry in feed.entries:
+                    video = self._parse_entry(entry, channel_id, channel_name)
+                    if video:
+                        videos.append(video)
+
+                logger.info(f"Parsed {len(videos)} videos from {channel_name}")
+                return videos
+
+            except requests.exceptions.Timeout:
+                last_error = f"Request timeout after {REQUEST_TIMEOUT}s"
+                logger.warning(f"Feed fetch attempt {attempt}/{MAX_RETRIES} failed for {feed_url}: {last_error}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY_SECONDS * attempt)
+                    continue
+            except requests.exceptions.RequestException as e:
+                last_error = f"Request error: {e}"
+                logger.warning(f"Feed fetch attempt {attempt}/{MAX_RETRIES} failed for {feed_url}: {last_error}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY_SECONDS * attempt)
+                    continue
+            except Exception as e:
+                last_error = f"Unexpected error: {e}"
+                logger.warning(f"Feed parse attempt {attempt}/{MAX_RETRIES} failed for {feed_url}: {last_error}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY_SECONDS * attempt)
+                    continue
+
+        logger.error(f"Feed processing failed after {MAX_RETRIES} attempts for {feed_url}: {last_error}")
+        return []
 
     def _parse_entry(self, entry: dict, channel_id: str, channel_name: str) -> Optional[YouTubeVideo]:
         """Parse a single feed entry into a YouTubeVideo."""

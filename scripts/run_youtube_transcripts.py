@@ -34,7 +34,7 @@ MIN_DURATION_SECONDS = 180
 TRANSCRIPT_FETCH_DELAY = 30
 
 # Default max transcripts per day (can be overridden in web_settings)
-DEFAULT_MAX_TRANSCRIPTS_PER_DAY = 5
+DEFAULT_MAX_TRANSCRIPTS_PER_DAY = 7
 
 
 def get_transcripts_downloaded_today(db: SupabaseClient) -> int:
@@ -126,7 +126,11 @@ def process_feed(
         'feed_title': feed_title,
         'videos_found': 0,
         'videos_new': 0,
+        'videos_over_3min': 0,
+        'videos_skipped_short': 0,
+        'videos_skipped_no_transcript': 0,
         'transcripts_downloaded': 0,
+        'usable_episodes': 0,
         'transcripts_scored': 0,
         'episodes_relevant': 0,
         'episodes_not_relevant': 0,
@@ -156,17 +160,17 @@ def process_feed(
 
         logger.info(f"Found {len(new_videos)} new videos to process")
 
-        # Track transcripts fetched in this feed
-        transcripts_fetched_this_feed = 0
+        # Track usable episodes created in this feed (for daily limit)
+        usable_episodes_this_feed = 0
 
         # Process each new video
         for video in new_videos:
-            # Check if we've hit the daily transcript limit
+            # Check if we've hit the daily episode limit
             if max_transcripts_remaining is not None:
-                remaining = max_transcripts_remaining - transcripts_fetched_this_feed
+                remaining = max_transcripts_remaining - usable_episodes_this_feed
                 if remaining <= 0:
                     logger.warning(
-                        f"Daily transcript limit reached. Skipping remaining {len(new_videos) - new_videos.index(video)} videos."
+                        f"Daily episode limit reached. Skipping remaining {len(new_videos) - new_videos.index(video)} videos."
                     )
                     break
             video_id = video.video_id
@@ -182,35 +186,18 @@ def process_feed(
             transcript_result = fetcher.fetch_transcript(video_id)
 
             if not transcript_result.success:
-                error_msg = f"Failed to fetch transcript for {video_id}: {transcript_result.error_message}"
-                logger.error(error_msg)
-                results['errors'].append(error_msg)
-
-                if not dry_run:
-                    # Create failed episode record
-                    try:
-                        db.create_episode(
-                            episode_guid=video_id,
-                            feed_id=feed_id,
-                            title=video.title,
-                            published_date=video.published_date,
-                            video_url=video.video_url,
-                            duration_seconds=None,
-                            description=video.description,
-                            transcript_content="",
-                            transcript_word_count=0,
-                            status='failed'
-                        )
-                        db.update_episode_failed(video_id, transcript_result.error_message)
-                    except Exception as e:
-                        logger.error(f"Failed to create failed episode record: {e}")
+                # Skip videos without transcripts (same as skipping short videos)
+                results['videos_skipped_no_transcript'] += 1
+                logger.info(
+                    f"Skipping video without transcript: {video_id} "
+                    f"({transcript_result.error_message})"
+                )
                 continue
 
             results['transcripts_downloaded'] += 1
-            transcripts_fetched_this_feed += 1
 
             # Add delay between transcript fetches to avoid rate limiting
-            if transcripts_fetched_this_feed > 0 and not dry_run:
+            if not dry_run:
                 logger.info(f"Waiting {TRANSCRIPT_FETCH_DELAY}s before next transcript fetch...")
                 time.sleep(TRANSCRIPT_FETCH_DELAY)
 
@@ -219,11 +206,15 @@ def process_feed(
 
             # Skip short videos
             if estimated_duration < MIN_DURATION_SECONDS:
+                results['videos_skipped_short'] += 1
                 logger.info(
                     f"Skipping short video: {video_id} "
                     f"(estimated {estimated_duration}s < {MIN_DURATION_SECONDS}s)"
                 )
                 continue
+
+            # Video is over 3 minutes - count it
+            results['videos_over_3min'] += 1
 
             if dry_run:
                 logger.info(f"[DRY RUN] Would store transcript: {video_id} ({transcript_result.word_count} words)")
@@ -244,6 +235,8 @@ def process_feed(
                     status='transcribed'
                 )
                 logger.info(f"Created episode record: {episode_id}")
+                usable_episodes_this_feed += 1  # Count toward daily limit only after successful creation
+                results['usable_episodes'] += 1
             except Exception as e:
                 error_msg = f"Failed to create episode for {video_id}: {e}"
                 logger.error(error_msg)
@@ -357,20 +350,20 @@ def main():
         lookback_days = db.get_setting('pipeline', 'discovery_lookback_days', 5)
         logger.info(f"Using lookback period: {lookback_days} days")
 
-        # Get max transcripts per day from settings
+        # Get max usable episodes per day from settings
         max_transcripts_per_day = db.get_setting('youtube', 'max_transcripts_per_day', DEFAULT_MAX_TRANSCRIPTS_PER_DAY)
-        logger.info(f"Max transcripts per day: {max_transcripts_per_day}")
+        logger.info(f"Max usable episodes per day: {max_transcripts_per_day}")
 
-        # Count transcripts already fetched today
+        # Count usable episodes already created today
         transcripts_today = get_transcripts_downloaded_today(db)
-        logger.info(f"Transcripts downloaded today so far: {transcripts_today}")
+        logger.info(f"Usable episodes created today so far: {transcripts_today}")
 
         if transcripts_today >= max_transcripts_per_day:
-            logger.warning(f"Daily transcript limit ({max_transcripts_per_day}) already reached. Exiting.")
+            logger.warning(f"Daily episode limit ({max_transcripts_per_day}) already reached. Exiting.")
             return 0
 
         transcripts_remaining = max_transcripts_per_day - transcripts_today
-        logger.info(f"Transcripts remaining for today: {transcripts_remaining}")
+        logger.info(f"Episodes remaining for today: {transcripts_remaining}")
 
         feed_processor = YouTubeFeedProcessor(lookback_days=lookback_days)
 
@@ -425,12 +418,12 @@ def main():
 
         # Process each feed
         all_results = []
-        total_transcripts_fetched = 0
+        total_usable_episodes = 0
 
         for i, feed in enumerate(feeds):
             # Check if we've hit the daily limit across all feeds
-            if transcripts_remaining - total_transcripts_fetched <= 0:
-                logger.warning("Daily transcript limit reached. Stopping feed processing.")
+            if transcripts_remaining - total_usable_episodes <= 0:
+                logger.warning("Daily episode limit reached. Stopping feed processing.")
                 break
 
             results = process_feed(
@@ -444,12 +437,12 @@ def main():
                 topics_with_tracking=topics_with_tracking,
                 dry_run=args.dry_run,
                 logger=logger,
-                max_transcripts_remaining=transcripts_remaining - total_transcripts_fetched
+                max_transcripts_remaining=transcripts_remaining - total_usable_episodes
             )
             all_results.append(results)
 
-            # Track total transcripts fetched
-            total_transcripts_fetched += results['transcripts_downloaded']
+            # Track total usable episodes (for daily limit)
+            total_usable_episodes += results['usable_episodes']
 
         # Summary
         logger.info("=" * 60)
@@ -458,7 +451,11 @@ def main():
 
         total_videos = sum(r['videos_found'] for r in all_results)
         total_new = sum(r['videos_new'] for r in all_results)
+        total_over_3min = sum(r['videos_over_3min'] for r in all_results)
+        total_skipped_short = sum(r['videos_skipped_short'] for r in all_results)
+        total_skipped_no_transcript = sum(r['videos_skipped_no_transcript'] for r in all_results)
         total_transcripts = sum(r['transcripts_downloaded'] for r in all_results)
+        total_usable = sum(r['usable_episodes'] for r in all_results)
         total_scored = sum(r['transcripts_scored'] for r in all_results)
         total_relevant = sum(r['episodes_relevant'] for r in all_results)
         total_not_relevant = sum(r['episodes_not_relevant'] for r in all_results)
@@ -466,9 +463,13 @@ def main():
         total_errors = sum(len(r['errors']) for r in all_results)
 
         logger.info(f"Feeds processed: {len(feeds)}")
-        logger.info(f"Videos found: {total_videos}")
-        logger.info(f"New videos: {total_new}")
+        logger.info(f"Videos in feeds: {total_videos}")
+        logger.info(f"New videos (in lookback period): {total_new}")
+        logger.info(f"Videos over 3 min: {total_over_3min}")
+        logger.info(f"Videos skipped (< 3 min): {total_skipped_short}")
+        logger.info(f"Videos skipped (no transcript): {total_skipped_no_transcript}")
         logger.info(f"Transcripts downloaded: {total_transcripts}")
+        logger.info(f"Usable episodes created: {total_usable}")
         logger.info(f"Episodes scored: {total_scored}")
         logger.info(f"Episodes relevant: {total_relevant}")
         logger.info(f"Episodes not relevant: {total_not_relevant}")

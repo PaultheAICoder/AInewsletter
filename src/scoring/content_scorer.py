@@ -175,7 +175,7 @@ Provide scores for each topic as a JSON object with topic names as keys and scor
                         "strict": True
                     }
                 },
-                max_tokens=self.max_tokens
+                max_completion_tokens=self.max_tokens
             )
 
             # Parse response

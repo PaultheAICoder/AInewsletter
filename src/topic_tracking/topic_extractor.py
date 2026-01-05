@@ -149,7 +149,7 @@ class StoryArcExtractor:
                         "strict": True,
                     },
                 },
-                max_tokens=3000,
+                max_completion_tokens=3000,
             )
 
             # Parse response
