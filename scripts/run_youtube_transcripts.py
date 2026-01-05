@@ -25,7 +25,7 @@ from src.youtube.ytdlp_fetcher import YtdlpTranscriptFetcher
 from src.youtube.feed_processor import YouTubeFeedProcessor
 from src.database.supabase_client import SupabaseClient
 from src.scoring.content_scorer import ContentScorer
-from src.topic_tracking.topic_extractor import TopicExtractor
+from src.topic_tracking.topic_extractor import StoryArcExtractor
 
 # Minimum video duration in seconds (3 minutes)
 MIN_DURATION_SECONDS = 180
@@ -103,7 +103,7 @@ def process_feed(
     feed_processor: YouTubeFeedProcessor,
     scorer: ContentScorer,
     score_threshold: float,
-    topic_extractor: TopicExtractor = None,
+    story_arc_extractor: StoryArcExtractor = None,
     topics_with_tracking: list = None,
     dry_run: bool = False,
     logger: logging.Logger = None,
@@ -268,10 +268,10 @@ def process_feed(
                 relevant_topics = scorer.get_relevant_topics(scoring_result.scores)
                 logger.info(f"Episode {video_id} is RELEVANT for topics: {relevant_topics}")
 
-                # Extract topics for topics with tracking enabled AND score >= min_score_for_extraction
+                # Extract story arcs for topics with tracking enabled AND score >= threshold
                 # This aligns with podscrape2's approach
-                if topic_extractor and topics_with_tracking and not dry_run:
-                    # Get episode ID from database
+                if story_arc_extractor and topics_with_tracking and not dry_run:
+                    # Get episode details from database
                     episode = db.get_episode_by_guid(video_id)
                     if episode:
                         # Only extract for topics that have tracking enabled
@@ -280,7 +280,7 @@ def process_feed(
                         for topic_name in relevant_topics:
                             # Skip if topic doesn't have tracking enabled
                             if topic_name not in tracking_topic_names:
-                                logger.debug(f"Skipping topic extraction for '{topic_name}' (tracking not enabled)")
+                                logger.debug(f"Skipping story arc extraction for '{topic_name}' (tracking not enabled)")
                                 continue
 
                             topic_score = scoring_result.scores.get(topic_name, 0.0)
@@ -288,23 +288,28 @@ def process_feed(
                             # Skip if score below threshold (podscrape2 alignment)
                             if topic_score < score_threshold:
                                 logger.debug(
-                                    f"Skipping topic extraction for '{topic_name}' "
+                                    f"Skipping story arc extraction for '{topic_name}' "
                                     f"(score {topic_score:.2f} < {score_threshold})"
                                 )
                                 continue
 
                             try:
-                                extracted = topic_extractor.extract_and_store_topics(
+                                extracted = story_arc_extractor.extract_and_store_story_arcs(
                                     episode_id=episode['id'],
                                     episode_guid=video_id,
+                                    feed_id=feed_id,
                                     digest_topic=topic_name,
                                     transcript=transcript_result.transcript_text,
+                                    episode_title=video.title,
+                                    episode_published_date=video.published_date,
                                     relevance_score=topic_score
                                 )
                                 results['topics_extracted'] += len(extracted)
+                                new_arcs = len([r for r in extracted if r.get('is_new')])
+                                continued_arcs = len([r for r in extracted if not r.get('is_new')])
                                 logger.info(
-                                    f"Extracted {len(extracted)} topics for {video_id} "
-                                    f"under '{topic_name}'"
+                                    f"Story arcs for {video_id} under '{topic_name}': "
+                                    f"{new_arcs} new, {continued_arcs} continued"
                                 )
                             except Exception as e:
                                 error_msg = f"Topic extraction failed for {video_id}/{topic_name}: {e}"
@@ -385,24 +390,19 @@ def main():
             db_client=db  # Load model from web_settings
         )
 
-        # Initialize topic extractor (aligned with podscrape2 settings)
-        max_topics_per_episode = db.get_setting('topic_tracking', 'max_topics_per_episode', 15)
-        novelty_threshold = db.get_setting('topic_evolution', 'novelty_threshold', 0.30)
-        enable_novelty = db.get_setting('topic_evolution', 'enable_novelty_detection', True)
+        # Initialize story arc extractor
+        max_arcs_per_episode = db.get_setting('topic_tracking', 'max_topics_per_episode', 10)
 
         # Get topics with topic tracking enabled (like podscrape2)
         topics_with_tracking = db.get_topics_with_tracking_enabled()
         logger.info(f"Topics with tracking enabled: {[t['name'] for t in topics_with_tracking]}")
 
-        topic_extractor = TopicExtractor(
+        story_arc_extractor = StoryArcExtractor(
             db_client=db,
-            max_topics=max_topics_per_episode,
-            novelty_threshold=novelty_threshold,
-            enable_novelty_detection=enable_novelty
+            max_arcs_per_episode=max_arcs_per_episode
         )
         logger.info(
-            f"TopicExtractor initialized: max_topics={max_topics_per_episode}, "
-            f"score_threshold={score_threshold}, novelty_threshold={novelty_threshold}"
+            f"StoryArcExtractor initialized: max_arcs_per_episode={max_arcs_per_episode}"
         )
 
         # Get YouTube feeds
@@ -433,7 +433,7 @@ def main():
                 feed_processor=feed_processor,
                 scorer=scorer,
                 score_threshold=score_threshold,
-                topic_extractor=topic_extractor,
+                story_arc_extractor=story_arc_extractor,
                 topics_with_tracking=topics_with_tracking,
                 dry_run=args.dry_run,
                 logger=logger,

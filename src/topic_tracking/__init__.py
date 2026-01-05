@@ -1,12 +1,10 @@
 """
 Topic Tracking Module
 
-Extracts and tracks topics from transcripts for deduplication and evolution tracking.
-Includes semantic matching to prevent duplicate topics and consolidate related content.
+Extracts and tracks story arcs from transcripts.
+Story arcs are evolving news narratives tracked across multiple episodes.
 """
 
-from src.topic_tracking.topic_extractor import TopicExtractor
-from src.topic_tracking.novelty_detector import NoveltyDetector
-from src.topic_tracking.semantic_matcher import SemanticTopicMatcher
+from src.topic_tracking.topic_extractor import StoryArcExtractor
 
-__all__ = ['TopicExtractor', 'NoveltyDetector', 'SemanticTopicMatcher']
+__all__ = ['StoryArcExtractor']
