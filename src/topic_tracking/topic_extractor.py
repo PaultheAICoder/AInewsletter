@@ -52,7 +52,7 @@ class StoryArcExtractor:
     def __init__(
         self,
         db_client,
-        max_arcs_per_episode: int = 10,
+        max_arcs_per_episode: int = 3,
     ):
         """
         Initialize StoryArcExtractor.
@@ -323,6 +323,22 @@ For this episode from "{episode_title}", identify:
    - Only create if this is a significant, newsworthy development
    - Don't create arcs for general discussion topics (too broad)
    - Each arc should be specific enough to track over time
+
+## CRITICAL GUIDELINES - READ CAREFULLY
+
+1. **STRONGLY prefer adding events to existing arcs over creating new arcs**
+   - If content relates to ANY existing arc, add an event to it instead of creating a new arc
+   - Look for thematic overlap, not just exact matches
+
+2. **Only create a NEW arc if this is a significant story likely to have follow-up coverage**
+   - One-off mentions or general discussions should NOT become arcs
+   - Ask: "Will this specific story likely appear in future episodes?"
+
+3. **Maximum 2-3 story arcs per episode** - quality over quantity
+   - If you find more than 3 relevant stories, pick the most significant ones
+
+4. **When in doubt, add to an existing arc with a similar theme**
+   - Example: "Claude Code Updates" should be added to existing "Claude Code" arc, not create a new one
 
 ## CLASSIFICATION CATEGORIES
 Use one of these for each arc:

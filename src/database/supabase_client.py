@@ -810,31 +810,44 @@ class SupabaseClient:
                 cur.execute(query, (digest_id, now, now, story_arc_id))
                 conn.commit()
 
-    def cleanup_old_story_arcs(self, days: int = None) -> int:
+    def cleanup_old_story_arcs(
+        self,
+        max_age_days: int = None,
+        inactivity_days: int = None
+    ) -> int:
         """
-        Delete story arcs older than retention period.
+        Delete story arcs that are:
+        1. Older than max_age_days (regardless of activity), OR
+        2. Haven't had new events in inactivity_days
 
         Args:
-            days: Override retention days
+            max_age_days: Maximum age for arcs (default from settings: 14)
+            inactivity_days: Delete if no events for this many days (default from settings: 7)
 
         Returns:
             Number of arcs deleted
         """
-        if days is None:
-            days = self.get_setting('story_arcs', 'retention_days', 14)
+        if max_age_days is None:
+            max_age_days = self.get_setting('retention', 'story_arc_retention_days', 14)
+        if inactivity_days is None:
+            inactivity_days = self.get_setting('retention', 'story_arc_inactivity_days', 7)
 
         # Note: story_arc_events are deleted via CASCADE
+        # Delete arcs that are either:
+        # 1. Started more than max_age_days ago, OR
+        # 2. Last updated more than inactivity_days ago
         query = """
             DELETE FROM story_arcs
-            WHERE last_updated_at < NOW() - INTERVAL '%s days'
+            WHERE started_at < NOW() - INTERVAL '%s days'
+               OR last_updated_at < NOW() - INTERVAL '%s days'
             RETURNING id
         """
 
         with self._get_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(query, (days,))
+                cur.execute(query, (max_age_days, inactivity_days))
                 deleted = cur.rowcount
                 conn.commit()
                 if deleted > 0:
-                    logger.info(f"Cleaned up {deleted} old story arcs")
+                    logger.info(f"Cleaned up {deleted} old story arcs (max_age={max_age_days}d, inactivity={inactivity_days}d)")
                 return deleted
